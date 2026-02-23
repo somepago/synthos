@@ -1,0 +1,26 @@
+# Core
+torch>=2.4.0
+torchvision>=0.19.0
+numpy>=2.0
+Pillow>=10.0
+tqdm>=4.65
+
+# Model loading
+safetensors>=0.4
+transformers>=4.40
+accelerate>=1.0
+diffsynth>=2.0
+
+# LoRA / fine-tuning
+peft>=0.12
+
+# Logging
+wandb>=0.17
+
+# Metrics (reward models for GRPO)
+hpsv2>=1.2
+open_clip_torch>=3.0
+timm>=1.0
+
+# Data
+datasets>=4.0

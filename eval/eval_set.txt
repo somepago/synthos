@@ -1,0 +1,14 @@
+# 6 Real (relaion-pop)
+000708629.webp
+002368074.jpg
+003382435.jpg
+001680577.jpg
+001882468.jpg
+002251861.jpg
+# 6 MJ (midjourney-top)
+f19ab5da-391a-42e7-94ab-3bbe5551e15b.jpeg
+61721a99-4ab5-4ac6-8c45-27a1843c5b64.jpeg
+7e19fe94-d1da-4bd0-9748-7e7664a1ed7c.jpeg
+43d29fd4-5596-4fc4-867b-8081baa87071.jpeg
+b6dfe030-f4a4-4e28-ae49-8493baa9bc32.jpeg
+223156ba-571e-404c-9ed6-5cd3443c230d.jpeg
