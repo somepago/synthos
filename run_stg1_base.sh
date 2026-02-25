@@ -1,6 +1,6 @@
 #!/bin/bash
-# Stage 1: Train SigLip projection layers with diffusion velocity matching
-# Run inside screen: screen -S stg1 bash run_stg1.sh
+# Stage 1: Train SigLip projection with Z-Image Base (50-step flow matching, cfg=4.0)
+# Run inside screen: screen -S stg1b bash run_stg1_base.sh
 
 set -euo pipefail
 
@@ -13,18 +13,18 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 export TOKENIZERS_PARALLELISM=false
 
 python train_stage1_projection.py \
-    --init_weights outputs/stage1/run_20260223_145106/checkpoints/step_02000.pt \
+    --model base \
     --data_dir /home/gnan/projects/data/datasets/relaion-art-lowres/ \
-    --lr 5e-4 \
-    --lr_warmup_steps 500 \
+    --lr 1e-4 \
+    --lr_warmup_steps 100 \
     --lr_min_ratio 0.01 \
     --grad_accum_steps 8 \
-    --steps 20000 \
+    --steps 5000 \
     --eval_every 100 \
-    --save_every 1000 \
+    --save_every 500 \
     --log_every 10 \
     --n_val 32 \
     --n_eval_images 12 \
     --max_size 768 \
     --image_size 512 \
-    --output_dir outputs/stage1
+    --output_dir outputs/stage1_base

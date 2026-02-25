@@ -9,8 +9,8 @@ Usage:
     # Text-to-image with base model
     python inference.py --prompt "a cat sitting on a chair" --model z-image-base
 
-    # Image-to-image (SigLip-conditioned)
-    python inference.py --prompt "oil painting of a cat" --edit_image cat.png
+    # Image-to-image via VL splice (Qwen3-VL visual encoder + Z-Image text encoder)
+    python inference.py --prompt "" --text_encoder qwen3vl --edit_image cat.png
 
     # With LoRA checkpoint
     python inference.py --prompt "a cat" --lora_path outputs/checkpoints/best.pt
@@ -25,7 +25,10 @@ import torch
 from PIL import Image
 
 from src.model_utils import load_pipeline, get_defaults
-from src.diffusion import get_latent_shape, generate_noise, run_full_diffusion, run_img2img
+from src.diffusion import (
+    get_latent_shape, generate_noise, run_full_diffusion,
+    encode_image_vl, encode_text_vl, _denoise_step, _decode_final,
+)
 
 
 def load_checkpoint(pipe, checkpoint_path: str):
@@ -54,20 +57,25 @@ def main():
     parser = argparse.ArgumentParser(description="Z-Image inference")
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--model", type=str, default=None,
-                        choices=["z-image-base", "z-image-turbo", "z-image-turbo-img2img"],
-                        help="Model key (auto-selects turbo-img2img if --edit_image is set)")
+                        choices=["z-image-base", "z-image-turbo"],
+                        help="Model key (default: z-image-turbo)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--output", type=str, default="output.png")
 
-    # img2img via SigLip conditioning
+    # img2img via VL splice
     parser.add_argument("--edit_image", type=str, default=None,
-                        help="Reference image for SigLip-conditioned img2img")
+                        help="Reference image for VL-conditioned img2img (requires --text_encoder qwen3vl)")
 
     # LoRA
     parser.add_argument("--lora_path", type=str, default=None,
                         help="Path to LoRA checkpoint")
+
+    # Text encoder
+    parser.add_argument("--text_encoder", type=str, default="qwen3",
+                        choices=["qwen3", "qwen3vl"],
+                        help="Text encoder: qwen3 (default), qwen3vl (VL splice for i2i)")
 
     # Override defaults
     parser.add_argument("--num_steps", type=int, default=None)
@@ -77,13 +85,11 @@ def main():
 
     args = parser.parse_args()
 
-    # Auto-select model: use img2img variant if edit_image is provided
-    model_key = args.model
-    if model_key is None:
-        model_key = "z-image-turbo-img2img" if args.edit_image else "z-image-turbo"
+    model_key = args.model or "z-image-turbo"
 
     # Load pipeline
-    pipe = load_pipeline(model_key, device=args.device, torch_dtype=args.dtype)
+    pipe = load_pipeline(model_key, device=args.device, torch_dtype=args.dtype,
+                         text_encoder=args.text_encoder)
     defaults = get_defaults(model_key)
     num_steps = args.num_steps or defaults["num_inference_steps"]
     cfg_scale = args.cfg_scale or defaults["cfg_scale"]
@@ -93,14 +99,28 @@ def main():
         load_checkpoint(pipe, args.lora_path)
 
     if args.edit_image:
-        # img2img: SigLip-conditioned generation
+        # img2img via VL splice
         edit_img = Image.open(args.edit_image).convert("RGB")
-        image = run_img2img(
-            pipe, args.prompt, edit_img,
-            num_inference_steps=num_steps, cfg_scale=cfg_scale,
-            height=args.height, width=args.width, seed=args.seed,
-        )
-        print(f"img2img (SigLip): {args.height}x{args.width}, steps={num_steps}, cfg={cfg_scale}")
+        prompt_embeds = encode_image_vl(pipe, edit_img, pipe.device)
+
+        shape = get_latent_shape(args.height, args.width)
+        noise = generate_noise(args.seed, shape, pipe.device, pipe.torch_dtype)
+
+        pipe.scheduler.set_timesteps(num_steps, denoising_strength=1.0, shift=None)
+        pipe.load_models_to_device(pipe.in_iteration_models)
+        models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+
+        shared = {"latents": noise}
+        posi = {"prompt_embeds": prompt_embeds}
+        nega = {}
+        if cfg_scale > 1.0:
+            neg_embeds = encode_text_vl(pipe, "", pipe.device)
+            nega = {"prompt_embeds": neg_embeds}
+        with torch.no_grad():
+            for pid, ts in enumerate(pipe.scheduler.timesteps):
+                _denoise_step(pipe, cfg_scale, shared, posi, nega, models, ts, pid)
+            image = _decode_final(pipe, shared)
+        print(f"img2img (VL splice): {args.height}x{args.width}, steps={num_steps}, cfg={cfg_scale}")
     else:
         # text2image
         shape = get_latent_shape(args.height, args.width)

@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Stage 1: Train SigLip projection layers with diffusion velocity-matching loss.
+Stage 1: Train SigLip projection to text embedding space.
 
-Trainable: siglip_embedder + siglip_refiner + siglip_pad_token (~358M params)
-Frozen: SigLip2 image encoder, DiT (all original weights), text encoder, VAE
+Trainable: siglip_projection (LayerNorm + Linear, 1152 → 2560, ~2.95M params)
+Frozen: SigLip2 image encoder, DiT (all weights), text encoder, VAE
+
+SigLip features are projected to text embedding space and concatenated with
+text embeddings as additional caption tokens. The DiT processes them through
+its standard (non-omni) text conditioning path.
 
 Usage:
     python train_stage1_projection.py
@@ -27,12 +31,12 @@ from tqdm import tqdm
 
 import wandb
 
-from src.model_utils import load_pipeline
+from src.model_utils import load_pipeline, get_defaults
 from src.constants import SCHEDULER_SCALE, TURBO_SCHEDULER_TIMESTEPS, FLOW_MATCHING_SHIFT
 from src.diffusion import (
     encode_image_vae,
     encode_image_siglip,
-    run_img2img,
+    run_img2img_siglip_caption,
 )
 
 
@@ -90,29 +94,36 @@ class ArtDataset:
 # =============================================================================
 
 class Stage1Trainer:
-    """Train SigLip projection layers with diffusion velocity matching."""
+    """Train SigLip → text-space projection with diffusion velocity matching."""
 
     def __init__(self, device="cuda", dtype="bfloat16", lr=1e-4,
                  warmup_steps=100, total_steps=5000, lr_min_ratio=0.01,
-                 max_grad_norm=5.0):
+                 max_grad_norm=5.0, model="turbo", text_encoder="qwen3"):
         self.device = device
+        self.model_type = model  # "turbo" or "base"
 
-        self.pipe = load_pipeline("z-image-turbo-img2img", device=device, torch_dtype=dtype)
+        model_key = "z-image-turbo-img2img" if model == "turbo" else "z-image-base-img2img"
+        self.pipe = load_pipeline(model_key, device=device, torch_dtype=dtype,
+                                  text_encoder=text_encoder)
         assert self.pipe.image_encoder is not None, "SigLip image encoder not loaded"
-        assert self.pipe.dit.siglip_embedder is not None, "SigLip projection layers not on DiT"
+        assert hasattr(self.pipe, "siglip_projection"), "SigLip projection not created"
+        # DiT should NOT have siglip_embedder — we use the non-omni path
+        assert self.pipe.dit.siglip_embedder is None, "DiT should not have siglip layers"
 
-        # Freeze everything, unfreeze only siglip projection layers
+        # Inference defaults for eval generation
+        defaults = get_defaults(model_key)
+        self.eval_num_steps = defaults["num_inference_steps"]
+        self.eval_cfg_scale = defaults["cfg_scale"]
+
+        # Freeze everything
         for param in self.pipe.dit.parameters():
             param.requires_grad_(False)
-        for name, param in self.pipe.dit.named_parameters():
-            if "siglip" in name:
-                param.requires_grad_(True)
 
-        trainable_count = sum(p.numel() for p in self.pipe.dit.parameters() if p.requires_grad)
-        total_count = sum(p.numel() for p in self.pipe.dit.parameters())
-        print(f"Trainable: {trainable_count:,} / {total_count:,} params")
+        # Only siglip_projection is trainable
+        trainable_params = list(self.pipe.siglip_projection.parameters())
+        trainable_count = sum(p.numel() for p in trainable_params)
+        print(f"Trainable: {trainable_count:,} params (siglip_projection)")
 
-        trainable_params = [p for p in self.pipe.dit.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
 
         # LR schedule: linear warmup + cosine decay
@@ -125,39 +136,53 @@ class Stage1Trainer:
         self.scheduler = LambdaLR(self.optimizer, warmup_cosine_schedule)
 
         self.pipe.scheduler.set_timesteps(1, denoising_strength=1.0, shift=None)
-        self.timesteps = TURBO_SCHEDULER_TIMESTEPS
+        # Turbo: sample from 8 fixed distilled timesteps
+        # Base: sample t uniformly from [0, 1] (standard flow matching)
+        self.timesteps = TURBO_SCHEDULER_TIMESTEPS if model == "turbo" else None
         self.shift = FLOW_MATCHING_SHIFT
         self.max_grad_norm = max_grad_norm
-        self._cached_empty_prompt = None
+        self._cached_text_embeds = None
 
     def _compute_sigma(self, t: float) -> float:
         return self.shift * t / (1 + (self.shift - 1) * t)
 
     @torch.no_grad()
-    def _get_empty_prompt_embeds(self, image: Image.Image):
-        """Encode empty prompt once and cache (omni mode structure)."""
-        if self._cached_empty_prompt is None:
+    def _get_text_embeds(self):
+        """Encode empty prompt once and cache. Returns tensor (L, 2560)."""
+        if self._cached_text_embeds is None:
             from diffsynth.pipelines.z_image import ZImageUnit_PromptEmbedder
             self.pipe.load_models_to_device(["text_encoder"])
             embedder = ZImageUnit_PromptEmbedder()
-            self._cached_empty_prompt = embedder.encode_prompt_omni(
-                self.pipe, "", edit_image=image, device=self.device,
-            )
-        return self._cached_empty_prompt
+            embeds_list = embedder.encode_prompt(self.pipe, "", self.device)
+            self._cached_text_embeds = embeds_list[0]  # (L, 2560)
+        return self._cached_text_embeds
 
     @torch.no_grad()
-    def _encode_inputs(self, image: Image.Image):
+    def _encode_frozen(self, image: Image.Image):
+        """Encode image through frozen encoders (VAE + SigLip). No grad needed."""
         z_0 = encode_image_vae(self.pipe, image)
-        image_embeds = encode_image_siglip(self.pipe, image)
-        prompt_embeds = self._get_empty_prompt_embeds(image)
-        return z_0, image_embeds, prompt_embeds
+        siglip_raw = encode_image_siglip(self.pipe, image)  # (H', W', 1152)
+        text_embeds = self._get_text_embeds()  # (L, 2560)
+        return z_0, siglip_raw, text_embeds
+
+    def _build_extended_prompt(self, siglip_raw, text_embeds):
+        """Project SigLip features and concat with text embeddings. Grad flows here."""
+        siglip_flat = siglip_raw.reshape(-1, siglip_raw.shape[-1])  # (H'*W', 1152)
+        siglip_projected = self.pipe.siglip_projection(siglip_flat)  # (H'*W', 2560)
+        return torch.cat([text_embeds, siglip_projected], dim=0)  # (L + H'*W', 2560)
 
     def _forward_loss(self, image: Image.Image, t: float = None):
-        """Compute velocity matching loss for a single sample. Returns loss tensor."""
-        z_0, image_embeds, prompt_embeds = self._encode_inputs(image)
+        """Compute velocity matching loss for a single sample."""
+        z_0, siglip_raw, text_embeds = self._encode_frozen(image)
+
+        # Project SigLip → text space (trainable, grad flows)
+        extended_prompt = self._build_extended_prompt(siglip_raw, text_embeds)
 
         if t is None:
-            t = random.choice(self.timesteps)
+            if self.timesteps is not None:
+                t = random.choice(self.timesteps)  # turbo: 8 fixed timesteps
+            else:
+                t = random.random()  # base: uniform [0, 1)
         sigma = self._compute_sigma(t)
 
         noise = torch.randn_like(z_0)
@@ -169,9 +194,8 @@ class Stage1Trainer:
 
         timestep_t = torch.tensor([t * SCHEDULER_SCALE], dtype=self.pipe.torch_dtype, device=self.device)
         inputs_shared = {"latents": z_t}
-        inputs_posi = {"prompt_embeds": prompt_embeds, "image_embeds": [image_embeds], "image_latents": [z_0]}
-        # cfg_scale=1.0 → negative path never runs, pass empty dict
-        inputs_nega = {}
+        inputs_posi = {"prompt_embeds": extended_prompt}
+        inputs_nega = {}  # cfg_scale=1.0 → negative path never runs
 
         v_pred = self.pipe.cfg_guided_model_fn(
             self.pipe.model_fn, 1.0,
@@ -193,7 +217,7 @@ class Stage1Trainer:
             last_t = t
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in self.pipe.dit.parameters() if p.requires_grad], max_norm=self.max_grad_norm,
+            list(self.pipe.siglip_projection.parameters()), max_norm=self.max_grad_norm,
         )
         self.optimizer.step()
         self.scheduler.step()
@@ -216,38 +240,36 @@ class Stage1Trainer:
         return sum(losses) / len(losses)
 
     @torch.no_grad()
-    def generate_sample(self, image: Image.Image, caption: str, seed: int = 42) -> Image.Image:
-        return run_img2img(
-            self.pipe, caption, image,
-            num_inference_steps=8, cfg_scale=1.0,
+    def generate_sample(self, image: Image.Image, seed: int = 42) -> Image.Image:
+        return run_img2img_siglip_caption(
+            self.pipe, "", image,
+            num_inference_steps=self.eval_num_steps,
+            cfg_scale=self.eval_cfg_scale,
             height=512, width=512, seed=seed,
         )
 
     def save_checkpoint(self, path: str, step: int):
-        siglip_state = {}
-        for name, param in self.pipe.dit.named_parameters():
-            if "siglip" in name:
-                siglip_state[name] = param.cpu()
-
         torch.save({
             "step": step,
-            "siglip_state_dict": siglip_state,
+            "siglip_projection_state_dict": self.pipe.siglip_projection.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
         }, path)
         print(f"Saved checkpoint to {path}")
 
-    def load_checkpoint(self, path: str) -> int:
+    def load_checkpoint(self, path: str, weights_only: bool = False) -> int:
+        """Load checkpoint. If weights_only=True, only load projection weights
+        (fresh optimizer + scheduler for new LR/schedule)."""
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        siglip_state = checkpoint["siglip_state_dict"]
-        for name, param in self.pipe.dit.named_parameters():
-            if name in siglip_state:
-                param.data.copy_(siglip_state[name].to(param.device, param.dtype))
+        self.pipe.siglip_projection.load_state_dict(checkpoint["siglip_projection_state_dict"])
+        step = checkpoint.get("step", 0)
+        if weights_only:
+            print(f"Loaded projection weights from {path} (step {step}, fresh optimizer)")
+            return 0  # restart step counter
         if "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        step = checkpoint.get("step", 0)
         print(f"Loaded checkpoint from {path} (step {step})")
         return step
 
@@ -276,10 +298,18 @@ def main():
                         help="Max image dimension (preserves aspect ratio, rounds to 16)")
     parser.add_argument("--image_size", type=int, default=512,
                         help="Fixed size for eval images")
+    parser.add_argument("--model", type=str, default="turbo", choices=["turbo", "base"],
+                        help="Model variant: turbo (8-step distilled) or base (50-step flow matching)")
+    parser.add_argument("--text_encoder", type=str, default="qwen3",
+                        choices=["qwen3", "qwen3vl"],
+                        help="Text encoder: qwen3 (default), qwen3vl (VL splice for i2i)")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--output_dir", type=str, default="outputs/stage1")
-    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from checkpoint (weights + optimizer + scheduler)")
+    parser.add_argument("--init_weights", type=str, default=None,
+                        help="Init projection weights from checkpoint (fresh optimizer/scheduler)")
     parser.add_argument("--grad_accum_steps", type=int, default=1,
                         help="Gradient accumulation steps (effective batch size)")
     parser.add_argument("--max_grad_norm", type=float, default=5.0)
@@ -333,12 +363,15 @@ def main():
         device=args.device, dtype=args.dtype, lr=args.lr,
         warmup_steps=args.lr_warmup_steps, total_steps=args.steps,
         lr_min_ratio=args.lr_min_ratio, max_grad_norm=args.max_grad_norm,
+        model=args.model, text_encoder=args.text_encoder,
     )
 
-    # Resume from checkpoint
+    # Resume or init from checkpoint
     start_step = 0
     if args.resume:
         start_step = trainer.load_checkpoint(args.resume)
+    elif args.init_weights:
+        trainer.load_checkpoint(args.init_weights, weights_only=True)
 
     # Pick fixed validation images (for val loss)
     val_images = []
@@ -363,7 +396,7 @@ def main():
     # Init wandb
     if not args.no_wandb:
         wandb.init(
-            project="synthos-train-stg1",
+            project=f"synthos-train-stg1-{args.model}",
             config=vars(args),
             dir=str(run_dir),
             resume="allow" if args.resume else None,
@@ -405,18 +438,18 @@ def main():
                 wandb.log(log_dict, step=step)
             running_loss = 0.0
 
-        # --- Eval: image generation + HPSv3 ---
+        # --- Eval: image generation + HPS ---
         if step % args.eval_every == 0:
             tqdm.write(f"  [Eval @ step {step}] generating {n_eval} samples...")
             eval_log = {}
             generated = []
 
             for i, img in enumerate(eval_images):
-                recon = trainer.generate_sample(img, "", seed=42)
+                recon = trainer.generate_sample(img, seed=42)
                 recon.save(run_dir / "samples" / f"step_{step:05d}_s{i}.png")
                 generated.append(recon)
 
-            # Log as wandb image list (diffscapes pattern)
+            # Log as wandb image list
             eval_log["eval/samples"] = [
                 wandb.Image(recon, caption=f"p{i}_s0: {eval_filenames[i][:30]}")
                 for i, recon in enumerate(generated)

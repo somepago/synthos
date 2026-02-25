@@ -71,16 +71,105 @@ def encode_image_siglip(pipe, image: Image.Image) -> torch.Tensor:
 
 
 # =============================================================================
+# VL encoder helpers (Qwen3-VL with Z-Image LLM weights spliced in)
+# =============================================================================
+
+def _cap_resolution(image: Image.Image, max_pixels: int) -> Image.Image:
+    """Resize image if total pixels exceed max_pixels, preserving aspect ratio."""
+    w, h = image.size
+    if w * h > max_pixels:
+        scale = (max_pixels / (w * h)) ** 0.5
+        image = image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    return image
+
+
+@torch.no_grad()
+def encode_image_vl(pipe, image: Image.Image, device: str,
+                    max_pixels: int = 768 * 768) -> torch.Tensor:
+    """Encode an image via spliced VL model. Returns (L, 2560).
+
+    Full VL forward pass: image goes through ViT → merger → spliced LLM
+    with chat template context. Hidden states include both visual and text
+    template tokens, filtered by attention mask.
+
+    Args:
+        max_pixels: Cap total pixels to limit token count (default 768*768 ~750 tokens).
+    """
+    if getattr(pipe, 'vl_model', None) is None:
+        raise RuntimeError("No VL model available (load with text_encoder='qwen3vl')")
+
+    image = _cap_resolution(image, max_pixels)
+
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": image},
+        {"type": "text", "text": ""},
+    ]}]
+    text = pipe.vl_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = pipe.vl_processor(text=[text], images=[image], return_tensors="pt").to(device)
+
+    out = pipe.vl_model.model(**inputs, output_hidden_states=True)
+    h = out.hidden_states[-2][0]
+    mask = inputs["attention_mask"][0].bool()
+    return h[mask]
+
+
+@torch.no_grad()
+def encode_text_vl(pipe, text: str, device: str) -> torch.Tensor:
+    """Encode text via spliced VL model. Returns (L, 2560).
+
+    Used for negative prompts when cfg_scale > 1.0 with VL conditioning.
+    """
+    if getattr(pipe, 'vl_model', None) is None:
+        raise RuntimeError("No VL model available (load with text_encoder='qwen3vl')")
+
+    messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
+    chat_text = pipe.vl_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = pipe.vl_processor(text=[chat_text], return_tensors="pt").to(device)
+
+    out = pipe.vl_model.model(**inputs, output_hidden_states=True)
+    h = out.hidden_states[-2][0]
+    mask = inputs["attention_mask"][0].bool()
+    return h[mask]
+
+
+@torch.no_grad()
+def encode_images_vl(pipe, images: list, device: str,
+                     max_pixels: int = 512 * 512) -> torch.Tensor:
+    """Encode multiple images via spliced VL model in a single forward pass.
+
+    The LLM's self-attention lets visual tokens from different images attend
+    to each other, producing entangled representations.
+
+    Returns (L, 2560) where L includes visual + text template tokens.
+    """
+    if getattr(pipe, 'vl_model', None) is None:
+        raise RuntimeError("No VL model available (load with text_encoder='qwen3vl')")
+
+    resized = [_cap_resolution(img, max_pixels) for img in images]
+
+    content = [{"type": "image", "image": img} for img in resized]
+    content.append({"type": "text", "text": ""})
+    messages = [{"role": "user", "content": content}]
+
+    text = pipe.vl_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = pipe.vl_processor(text=[text], images=resized, return_tensors="pt").to(device)
+
+    out = pipe.vl_model.model(**inputs, output_hidden_states=True)
+    h = out.hidden_states[-2][0]
+    mask = inputs["attention_mask"][0].bool()
+    return h[mask]
+
+
+# =============================================================================
 # Internal helpers (for manual denoising loops)
 # =============================================================================
 
 def _prepare_diffusion(pipe, prompt: str, num_inference_steps: int):
-    """Common diffusion setup: set scheduler, encode prompt."""
-    from diffsynth.pipelines.z_image import ZImageUnit_PromptEmbedder
-
+    """Common diffusion setup: set scheduler, encode prompt via pipeline's text encoder."""
     pipe.scheduler.set_timesteps(num_inference_steps, denoising_strength=1.0, shift=None)
-    pipe.load_models_to_device(["text_encoder"])
 
+    from diffsynth.pipelines.z_image import ZImageUnit_PromptEmbedder
+    pipe.load_models_to_device(["text_encoder"])
     prompt_embedder = ZImageUnit_PromptEmbedder()
     prompt_embeds = prompt_embedder.encode_prompt(pipe, prompt, pipe.device)
     negative_embeds = prompt_embedder.encode_prompt(pipe, "", pipe.device)
@@ -136,22 +225,15 @@ def run_full_diffusion(
 
 
 @torch.no_grad()
-def run_img2img(
+def run_img2img_omni(
     pipe, prompt: str, edit_image: Image.Image,
     num_inference_steps: int = 8, cfg_scale: float = 1.0,
     height: int = 512, width: int = 512, seed: int = 42,
 ) -> Image.Image:
-    """Image-to-image via native pipeline with SigLip conditioning.
+    """Image-to-image via native pipeline with SigLip + VAE reference (omni mode).
 
-    Uses the pipeline's built-in edit_image pathway:
-    - SigLip encoder produces spatial features from edit_image
-    - Features are passed to the DiT as image_embeds (via model_fn)
-    - Generation is conditioned on both text prompt and image features
-
-    Args:
-        edit_image: Input/reference image for conditioning.
-        height, width: Output image dimensions.
-        seed: Random seed for noise generation.
+    Uses the pipeline's built-in edit_image pathway which passes BOTH
+    SigLip features AND VAE-encoded reference latents to the DiT.
     """
     return pipe(
         prompt=prompt,
@@ -162,3 +244,52 @@ def run_img2img(
         num_inference_steps=num_inference_steps,
         cfg_scale=cfg_scale,
     )
+
+
+@torch.no_grad()
+def run_img2img_siglip_caption(
+    pipe, prompt: str, edit_image: Image.Image,
+    num_inference_steps: int = 8, cfg_scale: float = 1.0,
+    height: int = 512, width: int = 512, seed: int = 42,
+) -> Image.Image:
+    """SigLip-as-caption image conditioning via the standard turbo (non-omni) path.
+
+    Projects SigLip features to text embedding space and concatenates with
+    text embeddings as extra caption tokens. Uses the frozen cap_embedder +
+    DiT text conditioning path — no omni mode, no noise masks.
+    """
+    from diffsynth.pipelines.z_image import ZImageUnit_PromptEmbedder
+
+    # Encode SigLip features and project to text space
+    siglip_raw = encode_image_siglip(pipe, edit_image)  # (H', W', 1152)
+    siglip_flat = siglip_raw.reshape(-1, siglip_raw.shape[-1])
+    siglip_projected = pipe.siglip_projection(siglip_flat)  # (H'*W', 2560)
+
+    # Encode text prompt via pipeline's text encoder
+    embedder = ZImageUnit_PromptEmbedder()
+    pipe.load_models_to_device(["text_encoder"])
+    text_embeds = embedder.encode_prompt(pipe, prompt, pipe.device)[0]  # (L, 2560)
+    neg_text_embeds = embedder.encode_prompt(pipe, "", pipe.device)[0]
+
+    # Build extended prompts: text + SigLip tokens
+    posi_prompt = torch.cat([text_embeds, siglip_projected], dim=0)
+    nega_prompt = torch.cat([neg_text_embeds, siglip_projected], dim=0)
+
+    # Generate noise
+    latent_shape = get_latent_shape(height, width)
+    noise = generate_noise(seed, latent_shape, pipe.device, pipe.torch_dtype)
+
+    # Denoise via standard turbo path
+    pipe.scheduler.set_timesteps(num_inference_steps, denoising_strength=1.0, shift=None)
+    pipe.load_models_to_device(pipe.in_iteration_models)
+    models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+
+    inputs_shared = {"latents": noise}
+    inputs_posi = {"prompt_embeds": posi_prompt}
+    inputs_nega = {"prompt_embeds": nega_prompt}
+
+    for progress_id, timestep in enumerate(pipe.scheduler.timesteps):
+        _denoise_step(pipe, cfg_scale, inputs_shared, inputs_posi, inputs_nega,
+                      models, timestep, progress_id)
+
+    return _decode_final(pipe, inputs_shared)

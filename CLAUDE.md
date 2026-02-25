@@ -1,13 +1,24 @@
 # Claude Instructions for Diffscapes Project
 
-ALWAYS READ DISCUSSION.md when you open a new claude! 
-ALWAYS ASK BEFORE LAUNCHING JOBS - OR RUN THEM INSIDE SCREEN
-DO NOT JUST SAY YES TO WHATEVERY I SAY, USE YOUR BRAIN AND THINK THROUGH, PUSH BACK IF WHAT IM SAYING IS INCORRECT.
-WHEN WRITING TO DISCUSSION.MD FILE, WRITE ONLY FACTS AND TODOS - NOT YOUR MADE UP HYPOTHESES. 
-DO NOT MAKE THINGS UP, IF YOU ARE MAKING CLAIMS ABOUT SOME PARTS OF CODE, VERIFY BEFORE STATING SOMETHING.
+-ALWAYS READ DISCUSSION.md when you open a new claude! 
+-ALWAYS ASK BEFORE LAUNCHING JOBS - OR RUN THEM INSIDE SCREEN
+-DO NOT JUST SAY YES TO WHATEVERY I SAY, USE YOUR BRAIN AND THINK THROUGH, PUSH BACK IF WHAT IM SAYING IS INCORRECT.
+-WHEN WRITING TO DISCUSSION.MD FILE, WRITE ONLY FACTS AND TODOS - NOT YOUR MADE UP HYPOTHESES. 
+-DO NOT MAKE THINGS UP, IF YOU ARE MAKING CLAIMS ABOUT SOME PARTS OF CODE, VERIFY BEFORE STATING SOMETHING.
+-MOST LIKELY THIS IS A UNIFIED MACHINE (DGX SPARK) - SO CHECK FIRST BEFORE YOU START WRITING OR PROPOSING OFFLOADING SORT OF PATTERNS WHEN WE HIT OOMS
+-DO NOT HIDE TESTING FOLDERS WHEN IM ASKING YOU TO TEST SOME THINGS - ALWAYS CLEARLY STATE WHERE I CAN SEE THOSE TESTING GENS OR LOGS, EITHER MAKE THEM IN PROJECT FOLDER OR EXPLICITLY TELL ME WHERE II CAN ACCESS THOSE.
 ## Project Overview
 
 <TBD>
+
+## Hard Facts (DO NOT suggest alternatives to these)
+
+- **Z-Image-Turbo is text-to-image only** — no siglip weights in checkpoint
+- **Omni weights are not released** — cannot load pretrained siglip projection
+- **Frozen DiT cannot learn to attend to new SigLip tokens from random projection alone** — the attention layers were never trained with SigLip features
+- **Pure SigLip conditioning without VAE tokens is unreliable** — the omni mode noise_mask/dual-adaln path is not viable for our setup
+- **Do NOT suggest omni mode, noise_mask tricks, or dummy VAE refs** — these have been tried and failed
+- **Current approach**: Treat SigLip features as extra caption tokens through the basic (non-omni) text conditioning path. DiT LoRA comes in Stage 2.
 ## Workflow Rules
 
 
