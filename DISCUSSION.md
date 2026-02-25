@@ -337,11 +337,125 @@ Exception: when the text instruction aligns with what the model would naturally 
 - HPSv2.1 (aesthetics) nearly tied — both produce visually decent images
 - DINOv2 sim (structural similarity to input) nearly tied — surprising, means t2i from dense caption recovers structure almost as well as i2i from the actual image
 
+### Unified Inference CLI
+
+Consolidated `inference.py` + `run_eval_40.py` into a single `inference.py` with unified CLI:
+- Single t2i: `python inference.py --prompt "a cat"`
+- Single i2i: `python inference.py --image cat.png`
+- Batch i2i from folder: `python inference.py --image eval_unified/images/`
+- Batch t2i from txt: `python inference.py --prompt captions.txt`
+- Paired batch: `python inference.py --image eval_unified/images/ --prompt captions.txt --metrics`
+- Metrics only: `python inference.py --metrics --skip_generation --output_dir outputs/some_run/`
+
+Metrics extracted to `src/metrics.py` (HPSv2.1, CLIP score, DINOv2 cosine sim).
+
+### Multi-Image Inference + Composition Baselines
+
+`inference_multi_image.py` — generates images from JSONL files with interleaved image/text content.
+
+**JSONL format** (one JSON array per line):
+```jsonl
+[{"img": "eval_unified/images/005.jpg"}, {"txt": "in the style of"}, {"img": "eval_unified/images/014.jpeg"}]
+[{"img": "eval_unified/images/000.jpg"}, {"img": "eval_unified/images/003.jpg"}]
+```
+
+**Blend modes** (`--blend_mode`):
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| B3: Concat | `concat` (default) | Full interleaved encoding — all images + text in one VL forward pass. Cross-image attention in LLM. |
+| B5: Weighted avg | `avg` | Encode each image SEPARATELY (no cross-attention), concatenate with per-image scaling: `[alpha * h1 ; (1-alpha) * h2]` |
+| B6: Weighted scale | `scale` | Encode TOGETHER (cross-attention), then scale output visual tokens by image-of-origin using `<\|vision_start\|>`/`<\|vision_end\|>` boundaries |
+
+`--alpha` controls first image weight (second gets 1-alpha). Default 0.5.
+
+**Key question B5 vs B3**: Token averaging (B5) destroys cross-image attention — image A's tokens never see image B's. If B3 beats B5, LLM reasoning between visual tokens matters. If B5 ≈ B3, cross-image attention isn't contributing.
+
+**Key question B6**: Whether per-image weighting after cross-attention produces controllable composition. Token positions correspond to input image order, but representations are entangled by layer 34.
+
+**Implementation** (`src/diffusion.py`):
+- `encode_interleaved_vl()` — B3: builds VL chat message from interleaved content, single forward pass
+- `encode_weighted_avg_vl()` — B5: separate `encode_image_vl()` calls per image, concatenated with alpha scaling
+- `encode_weighted_concat_vl()` — B6: single forward pass, then scales visual tokens by `_find_image_token_ranges()` using vision_start/end token IDs (151652/151653)
+
+### Baseline Runs (baselines_feb25)
+
+`run_baselines.sh` — overnight batch with resume support (`run_if_needed` checks for `meta.json`).
+
+**Runs:**
+1. i2i on all 84 eval images
+2. t2i on all 84 eval captions (paired with images, + metrics)
+3. Dense composition prompts (50 entries, `composition_prompts.jsonl`):
+   - B3 concat
+   - B5 avg: alpha ∈ {0.3, 0.5, 0.7, 0.9}
+   - B6 scale: alpha ∈ {0.3, 0.5, 0.7, 0.9}
+4. Light composition prompts (50 entries, `composition_light.jsonl`):
+   - B3 concat, B5 avg 0.3, B6 scale 0.3
+5. Caption-drop ablation (`composition_light_notext.jsonl` — images only, no text):
+   - B3 concat, B5 avg 0.3, B6 scale 0.3
+
+Outputs: `outputs/baselines_feb25/`
+
+### Eval Dataset
+
+`eval_unified/` — 84 curated images from 3 sources:
+- 12 relaion-pop (real photos)
+- 12 midjourney-top (generated, 1024px+)
+- 12 relaion-art-lowres (real art, 256-700px)
+- 24 more relaion-pop
+- 24 more midjourney-top (high-res, 1632-2688px)
+
+Structure:
+```
+eval_unified/
+  eval.csv                          # manifest: filepath, orig_name, dataset, type, dims, caption
+  images/                           # all 84 images (000.jpg — 083.jpeg)
+  composition_prompts.jsonl         # 50 dense multi-image composition prompts
+  composition_light.jsonl           # 50 lighter composition prompts
+  composition_light_notext.jsonl    # same 50 pairs, images only (caption-drop ablation)
+  multi_test.jsonl                  # 5-entry test set
+```
+
+### Resolution: 512 vs 1024
+
+**Finding**: Z-Image-Turbo was trained/distilled at **1024x1024** native resolution. Official DiffSynth-Studio examples and HuggingFace Space both default to 1024x1024. Our baselines were initially generated at 512x512, which likely degraded quality — especially fine details like eyes and faces in portraits.
+
+**Evidence from official code**:
+- DiffSynth-Studio `ZImagePipeline.__call__` defaults: `height=1024, width=1024`
+- HF Space uses 1024px with various aspect ratios (1024/1280/1536)
+- HF Space uses `guidance_scale=0.0` (equivalent to `cfg_scale=1.0`), `num_inference_steps=9`
+- Scheduler: `FlowMatchEulerDiscreteScheduler(shift=3.0)` — matches our setup
+
+**Other findings from DiffSynth source**:
+- Native Qwen3-4B text encoder uses `apply_chat_template(enable_thinking=True)` — adds thinking tokens to prompt. Our VL path does NOT use `enable_thinking`.
+- Text encoder output: `hidden_states[-2]` (second-to-last layer), padded to `max_length=512`, filtered by attention_mask to variable-length output
+- Z-Image's text encoder is essentially frozen Qwen3-4B base used as feature extractor
+
+**Action**: Updated all inference defaults from 512→1024. AR-matching uses `round_to_16(w, h, max_size=1024)` — scales images to fit within 1024 while preserving aspect ratio, rounded to 16px multiples.
+
+**Baseline runs at 1024px** (in `outputs/baselines_feb25/`):
+- `native_t2i_512`, `t2i_all_512`, `i2i_all_512` — old 512px runs (kept for comparison)
+- `native_t2i` — native Qwen3 pipeline t2i at 1024px
+- `t2i_all` — VL splice t2i at 1024px
+- `i2i_all` — VL splice i2i at 1024px
+
+Script: `run_1024_baselines.sh`
+
+**Timeout safety**: Added per-image timeout (120s for native, 180s for VL) using `signal.SIGALRM` to prevent GPU hangs. Timed-out images are skipped, generation continues.
+
+**Result**: 1024px runs completed successfully (84 images each, all three variants). Quality dramatically improved — face/eye artifacts from 512px runs are gone. Fine details (skin texture, iris detail, hair strands) now render cleanly across all three pipelines (native t2i, VL t2i, VL i2i).
+
+**Conclusion**: The 512px artifacts were NOT caused by our VL splice encoding — they were purely a resolution issue. The model produces clean output at its native 1024px training resolution. Our VL pipeline introduces no quality degradation compared to the native Qwen3 text encoder path.
+
 ### TODOs
 - [x] **Evaluate t2i vs i2i quality** — `run_eval_40.py`, results in `outputs/eval_40_vl/`
+- [x] **Unified inference CLI** — `inference.py` (t2i + i2i, single + batch, metrics)
+- [x] **Multi-image inference** — `inference_multi_image.py` with blend modes
+- [x] **Composition baselines** — B3/B5/B6 with alpha sweeps, light prompts, caption-drop ablation
 - [ ] Investigate `max_pixels` effect: old `test_qwen3vl.py` resized to 512x512 before encoding (~334 visual tokens), current code caps at 768*768 (~500-750 tokens). Lower token count may produce cleaner outputs — test 512*512 cap vs 768*768.
 - [ ] Z-Image Base model for training — may converge better with MSE loss since it's not distilled
 - [ ] Add relaion-pop dataset (`/home/gnan/projects/data/datasets/laion__relaion-pop/`) — higher resolution images
 - [ ] GRPO with LPIPS + SSIM + DINOv2 reward
 - [ ] Text-guided composition training: finetune (LoRA?) to make text instructions between images actually control composition
 - [ ] Multi-image composition as a research direction — zero-shot compositing puts elements from multiple images into one scene but doesn't truly blend styles/concepts. Training needed for real fusion.
+- [ ] Analyze baseline results — compare B3 vs B5 vs B6, effect of alpha, text vs no-text

@@ -1,44 +1,102 @@
 # Synthos
 
-Image-conditioned generation with Z-Image-Turbo via SigLip2 projection training.
+Image-conditioned generation with Z-Image-Turbo via Qwen3-VL splice encoding.
 
 ## Overview
 
-Two-stage training pipeline:
-1. **Stage 1** — Train SigLip projection layers (embedder + refiner + pad_token, ~358M params) with flow matching velocity loss. Everything else frozen (DiT 6.5B, SigLip2 encoder, text encoder, VAE).
-2. **Stage 2** — GRPO reinforcement learning (TODO)
+Z-Image-Turbo text-to-image model repurposed for image-conditioned generation by splicing Z-Image's trained LLM weights into Qwen3-VL, enabling visual tokens to condition the frozen DiT through the standard text conditioning path.
 
-## Stage 1: Projection Training
+## Inference
 
-Teaches the randomly initialized SigLip projection layers to pass image features into the frozen DiT for image-conditioned generation.
+### Single image (t2i / i2i)
 
 ```bash
-bash run_stg1.sh
+# Text-to-image
+python inference.py --prompt "a cat on a chair"
+
+# Image-to-image
+python inference.py --image photo.jpg
+
+# Both (same seed/resolution)
+python inference.py --prompt "a cat" --image photo.jpg
 ```
 
-Key details:
-- **Loss**: Flow matching velocity MSE — `v_target = noise - z_0` (matches `model_fn` negation convention)
-- **Omni mode**: DiT sees `[reference_image_latents, noisy_latents]` with `image_noise_mask=[0, 1]`
-- **Prompts**: Empty text (`""`) — pure image conditioning for Stage 1
-- **LR schedule**: Linear warmup + cosine decay
-- **Eval**: 12 curated images (6 real + 6 midjourney), HPSv2.1 scoring
-- **Logging**: wandb project `synthos-train-stg1`
+### Batch
+
+```bash
+# i2i on folder of images
+python inference.py --image eval_unified/images/
+
+# t2i from text file (one prompt per line)
+python inference.py --prompt captions.txt
+
+# Paired batch + metrics
+python inference.py --image eval_unified/images/ --prompt captions.txt --metrics
+```
+
+### Multi-image composition
+
+JSONL format — one JSON array per line with interleaved `{"img": path}` and `{"txt": str}`:
+
+```bash
+# Default: full cross-attention (B3)
+python inference_multi_image.py --input prompts.jsonl
+
+# B5: weighted averaging, no cross-attention
+python inference_multi_image.py --input prompts.jsonl --blend_mode avg --alpha 0.7
+
+# B6: cross-attention + per-image token scaling
+python inference_multi_image.py --input prompts.jsonl --blend_mode scale --alpha 0.7
+```
+
+Blend modes:
+- `concat` — interleaved encoding, full cross-image attention in LLM (default)
+- `avg` — encode images separately, concatenate with alpha scaling (no cross-attention)
+- `scale` — encode together, then scale visual tokens by image-of-origin
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--model` | `z-image-turbo` (default) or `z-image-base` |
+| `--text_encoder` | `qwen3vl` (default) or `qwen3` |
+| `--seed` | Random seed (default: 42) |
+| `--height/--width` | Output resolution (default: 512) |
+| `--num_steps` | Denoising steps (default: model-specific) |
+| `--cfg_scale` | Classifier-free guidance scale |
+| `--metrics` | Compute HPSv2.1, CLIP score, DINOv2 sim |
+| `--blend_mode` | `concat`, `avg`, `scale` (multi-image only) |
+| `--alpha` | First image weight for avg/scale (default: 0.5) |
+
+## Baselines
+
+```bash
+# Run all baselines (resumable — skips completed runs)
+screen -S baselines
+bash run_baselines.sh 2>&1 | tee outputs/baselines.log
+```
+
+See `run_baselines.sh` for full list. Includes i2i/t2i on 84 eval images, composition with dense/light prompts, caption-drop ablation, and alpha sweeps for B5/B6.
 
 ## Project Structure
 
 ```
-train_stage1_projection.py  # Stage 1 training script
-inference.py                # Text2img + img2img inference
-run_stg1.sh                 # Training launch script
+inference.py                    # Unified t2i + i2i inference (single + batch)
+inference_multi_image.py        # Multi-image composition inference
+run_baselines.sh                # Overnight baseline runs (resumable)
+train_stage1_projection.py      # Stage 1 SigLip projection training
 src/
-  model_utils.py            # Pipeline loading + SigLip setup
-  diffusion.py              # VAE/SigLip encoding, img2img helpers
-  constants.py              # Shared constants (timesteps, scheduler params)
-  env_setup.py              # Environment setup
-eval/
-  eval_set.txt              # 12 curated eval images
-  eval_prompts.txt          # Text prompts for future use
-  *.jpg/jpeg/webp           # Eval image files
+  diffusion.py                  # Encoding functions (VL, interleaved, weighted avg/scale)
+  model_utils.py                # Pipeline loading + VL splice
+  metrics.py                    # HPSv2.1, CLIP score, DINOv2 similarity
+  constants.py                  # Shared constants
+  env_setup.py                  # Environment setup
+eval_unified/
+  eval.csv                      # Image manifest (84 images)
+  images/                       # Eval images
+  composition_prompts.jsonl     # 50 dense multi-image prompts
+  composition_light.jsonl       # 50 light multi-image prompts
+  composition_light_notext.jsonl # Caption-drop ablation (images only)
 ```
 
 ## Setup
@@ -48,4 +106,4 @@ python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Models download automatically from ModelScope on first run. Set `DIFFSYNTH_MODEL_BASE_PATH` to control model cache location.
+Models download automatically from ModelScope on first run.

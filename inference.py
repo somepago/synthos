@@ -33,6 +33,7 @@ from src import env_setup  # noqa: F401
 import argparse
 import json
 import gc
+import signal
 import time
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,16 @@ from pathlib import Path
 import torch
 from PIL import Image
 from tqdm import tqdm
+
+TIMEOUT_PER_IMAGE = 180  # seconds — kill hung generation
+
+
+class _Timeout(Exception):
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise _Timeout("Generation timed out")
 
 from src.model_utils import load_pipeline, get_defaults
 from src.diffusion import (
@@ -178,8 +189,8 @@ def main():
 
     # Generation params
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--height", type=int, default=512)
-    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--height", type=int, default=1024)
+    parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--num_steps", type=int, default=None)
     parser.add_argument("--cfg_scale", type=float, default=None)
     parser.add_argument("--device", type=str, default="cuda")
@@ -217,11 +228,11 @@ def main():
         images = images * n
 
     # Resolve output directory
+    ts = datetime.now().strftime("%m%d_%H%M")
     if is_batch or args.skip_generation:
         if args.output_dir:
             output_dir = Path(args.output_dir)
         else:
-            ts = datetime.now().strftime("%m%d_%H%M")
             parts = ["gen"]
             if prompts:
                 parts.append("t2i")
@@ -297,6 +308,15 @@ def main():
         prompt = prompts[0] if prompts else None
         image_path = images[0] if images else None
 
+        # Build output path (auto-timestamp only if using default output name)
+        out_path = Path(args.output)
+        if args.output == "output.png":
+            out_stem = f"{out_path.stem}_{ts}"
+        else:
+            out_stem = out_path.stem
+        out_parent = out_path.parent
+        out_parent.mkdir(parents=True, exist_ok=True)
+
         h, w = resolve_resolution(image_path, args.height, args.width, max_size)
 
         if image_path and text_encoder == "qwen3vl":
@@ -312,14 +332,10 @@ def main():
                 t2i_embeds = encode_text_vl(pipe, prompt, pipe.device)
                 t2i_image = denoise_loop(pipe, t2i_embeds, h, w, args.seed,
                                          num_steps, cfg_scale)
-                # Save both: output stem + _i2i / _t2i
-                stem = Path(args.output).stem
-                parent = Path(args.output).parent
-                parent.mkdir(parents=True, exist_ok=True)
-                image.save(parent / f"{stem}_i2i.png")
-                t2i_image.save(parent / f"{stem}_t2i.png")
+                image.save(out_parent / f"{out_stem}_i2i.png")
+                t2i_image.save(out_parent / f"{out_stem}_t2i.png")
                 print(f"t2i: {h}x{w}, steps={num_steps}, cfg={cfg_scale}")
-                print(f"Saved to {parent / f'{stem}_i2i.png'} and {parent / f'{stem}_t2i.png'}")
+                print(f"Saved to {out_parent / f'{out_stem}_i2i.png'} and {out_parent / f'{out_stem}_t2i.png'}")
                 return
         elif prompt and not image_path:
             # t2i only
@@ -344,9 +360,9 @@ def main():
             print("ERROR: --image without qwen3vl text encoder, and no --prompt")
             return
 
-        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        image.save(args.output)
-        print(f"Saved to {args.output}")
+        save_path = out_parent / f"{out_stem}.png"
+        image.save(save_path)
+        print(f"Saved to {save_path}")
         return
 
     # --- Batch mode ---
@@ -354,39 +370,56 @@ def main():
     has_i2i = images is not None
     has_input = images is not None
 
+    signal.signal(signal.SIGALRM, _timeout_handler)
     t0 = time.time()
+    skipped = 0
     for i in tqdm(range(n), desc="generating"):
         image_path = images[i] if images else None
         prompt = prompts[i] if prompts else None
 
         h, w = resolve_resolution(image_path, args.height, args.width, max_size)
 
-        # i2i
-        if image_path and text_encoder == "qwen3vl":
-            input_img = Image.open(image_path).convert("RGB")
-            input_resized = input_img.resize((w, h), Image.LANCZOS)
-            input_resized.save(output_dir / f"input_{i:03d}.png")
+        try:
+            signal.alarm(TIMEOUT_PER_IMAGE)
 
-            prompt_embeds = encode_image_vl(pipe, input_img, pipe.device)
-            image = denoise_loop(pipe, prompt_embeds, h, w, args.seed,
-                                 num_steps, cfg_scale)
-            image.save(output_dir / f"i2i_{i:03d}.png")
+            # i2i
+            if image_path and text_encoder == "qwen3vl":
+                input_img = Image.open(image_path).convert("RGB")
+                input_resized = input_img.resize((w, h), Image.LANCZOS)
+                input_resized.save(output_dir / f"input_{i:03d}.png")
 
-        # t2i
-        if prompt:
-            if text_encoder == "qwen3vl":
-                t2i_embeds = encode_text_vl(pipe, prompt, pipe.device)
-                image = denoise_loop(pipe, t2i_embeds, h, w, args.seed,
+                prompt_embeds = encode_image_vl(pipe, input_img, pipe.device)
+                image = denoise_loop(pipe, prompt_embeds, h, w, args.seed,
                                      num_steps, cfg_scale)
-            else:
-                shape = get_latent_shape(h, w)
-                noise = generate_noise(args.seed, shape, args.device,
-                                       getattr(torch, args.dtype))
-                image = run_full_diffusion(pipe, prompt, noise, num_steps, cfg_scale)
-            image.save(output_dir / f"t2i_{i:03d}.png")
+                image.save(output_dir / f"i2i_{i:03d}.png")
 
+            # t2i
+            if prompt:
+                if text_encoder == "qwen3vl":
+                    t2i_embeds = encode_text_vl(pipe, prompt, pipe.device)
+                    image = denoise_loop(pipe, t2i_embeds, h, w, args.seed,
+                                         num_steps, cfg_scale)
+                else:
+                    shape = get_latent_shape(h, w)
+                    noise = generate_noise(args.seed, shape, args.device,
+                                           getattr(torch, args.dtype))
+                    image = run_full_diffusion(pipe, prompt, noise, num_steps, cfg_scale)
+                image.save(output_dir / f"t2i_{i:03d}.png")
+
+            signal.alarm(0)
+        except _Timeout:
+            print(f"\n  TIMEOUT [{i:03d}] — skipped after {TIMEOUT_PER_IMAGE}s")
+            skipped += 1
+            continue
+        except Exception as e:
+            signal.alarm(0)
+            print(f"\n  ERROR [{i:03d}]: {e}")
+            skipped += 1
+            continue
+
+    signal.alarm(0)
     elapsed = time.time() - t0
-    print(f"Generation done: {n} images in {elapsed:.1f}s")
+    print(f"Generation done: {n} images ({skipped} skipped) in {elapsed:.1f}s")
 
     # Save metadata for reproducibility
     meta = {

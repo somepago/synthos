@@ -160,6 +160,188 @@ def encode_images_vl(pipe, images: list, device: str,
     return h[mask]
 
 
+@torch.no_grad()
+def encode_interleaved_vl(pipe, content_list: list, device: str,
+                          max_pixels: int = 512 * 512) -> torch.Tensor:
+    """Encode interleaved image+text content via spliced VL model.
+
+    Args:
+        content_list: list of dicts, each {"img": PIL.Image} or {"txt": str}.
+            Images should already be opened as PIL.
+        device: compute device
+        max_pixels: cap per image
+
+    Returns (L, 2560) prompt embeddings.
+    """
+    if getattr(pipe, 'vl_model', None) is None:
+        raise RuntimeError("No VL model available (load with text_encoder='qwen3vl')")
+
+    chat_content = []
+    pil_images = []
+    for item in content_list:
+        if "img" in item:
+            img = _cap_resolution(item["img"], max_pixels)
+            chat_content.append({"type": "image", "image": img})
+            pil_images.append(img)
+        elif "txt" in item:
+            chat_content.append({"type": "text", "text": item["txt"]})
+
+    # Ensure there's at least some text (empty string) at the end for chat template
+    if not any("txt" in item for item in content_list):
+        chat_content.append({"type": "text", "text": ""})
+
+    messages = [{"role": "user", "content": chat_content}]
+    text = pipe.vl_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = pipe.vl_processor(
+        text=[text], images=pil_images if pil_images else None,
+        return_tensors="pt"
+    ).to(device)
+
+    out = pipe.vl_model.model(**inputs, output_hidden_states=True)
+    h = out.hidden_states[-2][0]
+    mask = inputs["attention_mask"][0].bool()
+    return h[mask]
+
+
+# =============================================================================
+# B5: Weighted token averaging (no cross-image attention)
+# =============================================================================
+
+@torch.no_grad()
+def encode_weighted_avg_vl(pipe, images: list, device: str,
+                           alpha: float = 0.5,
+                           max_pixels: int = 512 * 512) -> torch.Tensor:
+    """B5: Encode images SEPARATELY, then concatenate with per-image alpha scaling.
+
+    Each image gets its own VL forward pass — no cross-image attention.
+    Output is [alpha * h_img0 ; (1-alpha) * h_img1 ; ...] for 2 images,
+    or equal-weight scaling for 3+ images.
+
+    Args:
+        images: list of PIL Images
+        alpha: weight for first image (second gets 1-alpha). For 3+ images, ignored — uses equal weights.
+        max_pixels: cap per image
+
+    Returns (L_total, 2560) concatenated scaled embeddings.
+    """
+    if getattr(pipe, 'vl_model', None) is None:
+        raise RuntimeError("No VL model available (load with text_encoder='qwen3vl')")
+
+    if len(images) < 2:
+        raise ValueError("Need at least 2 images for weighted averaging")
+
+    # Determine weights
+    if len(images) == 2:
+        weights = [alpha, 1.0 - alpha]
+    else:
+        w = 1.0 / len(images)
+        weights = [w] * len(images)
+
+    # Encode each image separately
+    scaled_parts = []
+    for img, w in zip(images, weights):
+        h = encode_image_vl(pipe, img, device, max_pixels)
+        scaled_parts.append(h * w)
+
+    return torch.cat(scaled_parts, dim=0)
+
+
+# =============================================================================
+# B6: Weighted token concatenation (cross-attention + per-image scaling)
+# =============================================================================
+
+VISION_START_ID = 151652
+VISION_END_ID = 151653
+
+def _find_image_token_ranges(input_ids: torch.Tensor):
+    """Find (start, end) index ranges for each image's visual tokens in input_ids.
+
+    Looks for <|vision_start|> ... <|vision_end|> boundaries.
+    Returns list of (start_idx, end_idx) tuples (exclusive end).
+    The range covers tokens BETWEEN vision_start and vision_end (the visual tokens).
+    """
+    ids = input_ids.squeeze().tolist()
+    ranges = []
+    i = 0
+    while i < len(ids):
+        if ids[i] == VISION_START_ID:
+            start = i + 1  # first visual token is after vision_start
+            j = start
+            while j < len(ids) and ids[j] != VISION_END_ID:
+                j += 1
+            ranges.append((start, j))  # exclusive end
+            i = j + 1
+        else:
+            i += 1
+    return ranges
+
+
+@torch.no_grad()
+def encode_weighted_concat_vl(pipe, content_list: list, device: str,
+                              alpha: float = 0.5,
+                              max_pixels: int = 512 * 512) -> torch.Tensor:
+    """B6: Encode images TOGETHER (cross-attention), then scale output tokens by image-of-origin.
+
+    Full VL forward pass with all images seeing each other via self-attention.
+    After encoding, visual tokens from each image are scaled by their weight.
+    Non-visual tokens (chat template, text) are left unscaled.
+
+    Args:
+        content_list: list of dicts, each {"img": PIL.Image} or {"txt": str}
+        alpha: weight for first image's visual tokens (second gets 1-alpha)
+        max_pixels: cap per image
+
+    Returns (L, 2560) prompt embeddings with per-image visual token scaling.
+    """
+    if getattr(pipe, 'vl_model', None) is None:
+        raise RuntimeError("No VL model available (load with text_encoder='qwen3vl')")
+
+    # Build chat content (same as encode_interleaved_vl)
+    chat_content = []
+    pil_images = []
+    for item in content_list:
+        if "img" in item:
+            img = _cap_resolution(item["img"], max_pixels)
+            chat_content.append({"type": "image", "image": img})
+            pil_images.append(img)
+        elif "txt" in item:
+            chat_content.append({"type": "text", "text": item["txt"]})
+
+    if not any("txt" in item for item in content_list):
+        chat_content.append({"type": "text", "text": ""})
+
+    n_images = len(pil_images)
+    if n_images < 2:
+        raise ValueError("Need at least 2 images for weighted concat")
+
+    # Determine weights
+    if n_images == 2:
+        weights = [alpha, 1.0 - alpha]
+    else:
+        w = 1.0 / n_images
+        weights = [w] * n_images
+
+    messages = [{"role": "user", "content": chat_content}]
+    text = pipe.vl_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = pipe.vl_processor(
+        text=[text], images=pil_images if pil_images else None,
+        return_tensors="pt"
+    ).to(device)
+
+    # Find image token boundaries BEFORE forward pass
+    image_ranges = _find_image_token_ranges(inputs["input_ids"])
+
+    out = pipe.vl_model.model(**inputs, output_hidden_states=True)
+    h = out.hidden_states[-2][0]  # (seq_len, 2560)
+    mask = inputs["attention_mask"][0].bool()
+
+    # Scale visual tokens by image-of-origin weight
+    for (start, end), w in zip(image_ranges, weights):
+        h[start:end] *= w
+
+    return h[mask]
+
+
 # =============================================================================
 # Internal helpers (for manual denoising loops)
 # =============================================================================
