@@ -308,8 +308,37 @@ Exception: when the text instruction aligns with what the model would naturally 
 
 **Why**: The DiT was trained on text captions, not on compositional instructions between images. The VL model understands the instructions semantically (it's a language model), but the DiT's frozen attention layers don't know how to interpret "in the style of" as a compositional operation on the conditioning tokens. This would likely require training/finetuning.
 
+### Eval: t2i vs i2i (run_eval_40.py)
+
+**Setup**: 40 random images from relaion-art-lowres (seed=42, validated non-corrupt). Single qwen3vl pipeline for both:
+- **t2i**: `encode_text_vl(pipe, caption)` — text caption through VL model (same spliced LLM weights)
+- **i2i**: `encode_image_vl(pipe, image)` — image through VL ViT + spliced LLM
+- Same seed, same resolution (matched to input AR, rounded to 16px multiples, capped 768)
+- Turbo: 8 steps, cfg=1.0
+
+**Metrics**: HPSv2.1 (aesthetics), CLIP score (prompt adherence), DINOv2 cosine sim (structural similarity to input)
+
+**Outputs**: `outputs/eval_40_vl/` — `t2i_000.png`, `i2i_000.png`, `input_000.png` x40 + `results.json`
+
+**Status**: Done.
+
+**Captions**: Dense Qwen3-VL-8B captions from `somepago/relaion-art-qwen3vl-8b-caps`. Joined with local images by `_row_id` — 2457 images have both dense captions and images on disk, 40 sampled.
+
+**Results** (40 images, turbo 8-step, cfg=1.0):
+
+| Metric | t2i (mean ± std) | i2i (mean ± std) | diff |
+|--------|------------------|-------------------|------|
+| HPSv2.1 | 0.295 ± 0.025 | 0.286 ± 0.031 | -0.009 |
+| CLIP score | 0.366 ± 0.031 | 0.337 ± 0.036 | -0.029 |
+| DINOv2 sim | 0.720 ± 0.132 | 0.710 ± 0.123 | -0.010 |
+
+- i2i slightly worse across all metrics, but gaps are small
+- CLIP score has the biggest delta (-0.029) — t2i gets the caption directly, i2i must reconstruct content from visual features
+- HPSv2.1 (aesthetics) nearly tied — both produce visually decent images
+- DINOv2 sim (structural similarity to input) nearly tied — surprising, means t2i from dense caption recovers structure almost as well as i2i from the actual image
+
 ### TODOs
-- [ ] **Evaluate t2i vs i2i quality**: i2i quality appears lower than t2i. Need systematic evaluation with dense captions on multiple axes — HPSv2.1 (aesthetics), prompt adherence (CLIP-score or similar), LPIPS/SSIM (reconstruction fidelity for i2i), FID if we have enough samples. Use dense captions (e.g. from LLaVA or Qwen-VL itself) to compare t2i caption-based generation vs i2i VL-conditioned generation on the same images.
+- [x] **Evaluate t2i vs i2i quality** — `run_eval_40.py`, results in `outputs/eval_40_vl/`
 - [ ] Investigate `max_pixels` effect: old `test_qwen3vl.py` resized to 512x512 before encoding (~334 visual tokens), current code caps at 768*768 (~500-750 tokens). Lower token count may produce cleaner outputs — test 512*512 cap vs 768*768.
 - [ ] Z-Image Base model for training — may converge better with MSE loss since it's not distilled
 - [ ] Add relaion-pop dataset (`/home/gnan/projects/data/datasets/laion__relaion-pop/`) — higher resolution images

@@ -8,6 +8,9 @@ __pycache__/
 # Models & data (large files)
 models/
 outputs/
+archive/
+eval/
+eval_unified/
 
 # Environment
 .env
