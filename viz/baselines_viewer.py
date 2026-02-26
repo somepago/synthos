@@ -104,6 +104,8 @@ if not runs:
 # Group runs
 groups = {
     "Single Image (i2i / t2i)": [],
+    "Variations (token count)": [],
+    "Variations (text-guided)": [],
     "Dense Composition (50 prompts)": [],
     "Light Composition (50 prompts)": [],
     "Caption-Drop Ablation (images only)": [],
@@ -112,6 +114,10 @@ groups = {
 for name, path in runs.items():
     if name.startswith(("i2i_all", "t2i_all", "native_t2i")):
         groups["Single Image (i2i / t2i)"].append((name, path))
+    elif name == "vary_text":
+        groups["Variations (text-guided)"].append((name, path))
+    elif name.startswith("vary_"):
+        groups["Variations (token count)"].append((name, path))
     elif name.startswith("multi_"):
         groups["Dense Composition (50 prompts)"].append((name, path))
     elif name.startswith("light_"):
@@ -142,6 +148,8 @@ if meta.get("text_encoder"):
 st.sidebar.markdown(f"**Steps**: {meta.get('num_steps', '?')}")
 st.sidebar.markdown(f"**CFG**: {meta.get('cfg_scale', '?')}")
 st.sidebar.markdown(f"**Seed**: {meta.get('seed', '?')}")
+if meta.get("max_pixels"):
+    st.sidebar.markdown(f"**Max Pixels**: {meta['max_pixels']:,}")
 if "blend_mode" in meta:
     st.sidebar.markdown(f"**Blend**: {meta['blend_mode']}")
     st.sidebar.markdown(f"**Alpha**: {meta['alpha']}")
@@ -234,9 +242,103 @@ else:
     st.header(f"{run_name}")
 
     # Determine run type and render
+    is_text_variation = meta.get("type") == "text_variation"
     is_multi = "entries" in meta
 
-    if is_multi:
+    if is_text_variation:
+        # Text-guided variation view: input + baseline + text variants per image
+        images_meta = meta.get("images", [])
+        text_variants = meta.get("text_variants", {})
+        variant_keys = list(text_variants.keys())
+
+        # Load/init picks (persisted to JSON alongside the run)
+        picks_path = run_dir / "picks.json"
+        if "text_vary_picks" not in st.session_state:
+            if picks_path.exists():
+                st.session_state.text_vary_picks = json.loads(picks_path.read_text())
+            else:
+                st.session_state.text_vary_picks = {}
+        picks = st.session_state.text_vary_picks
+
+        # Pick mode toggle in sidebar
+        st.sidebar.markdown("---")
+        pick_mode = st.sidebar.checkbox("Label mode (mark what worked)")
+        n_picked = sum(1 for v in picks.values() if v)
+        if n_picked:
+            st.sidebar.markdown(f"**Picked**: {n_picked} variants")
+        if picks and st.sidebar.button("Save picks"):
+            picks_path.write_text(json.dumps(picks, indent=2))
+            st.sidebar.success(f"Saved to {picks_path}")
+        if picks and st.sidebar.button("Show only picked"):
+            st.session_state.text_vary_filter_picked = not st.session_state.get("text_vary_filter_picked", False)
+        filter_picked = st.session_state.get("text_vary_filter_picked", False)
+
+        for list_idx, img_info in enumerate(images_meta):
+            if list_idx < sample_range[0] or list_idx > sample_range[1]:
+                continue
+            idx_num = img_info["idx"]
+            prefix = f"{idx_num:03d}"
+            desc = img_info.get("desc", "")
+
+            input_path = run_dir / f"{prefix}_input.png"
+            baseline_path = run_dir / f"{prefix}_baseline.png"
+            if not baseline_path.exists():
+                continue
+
+            # Collect variants for this image
+            variant_cols_data = []
+            for key in variant_keys:
+                vpath = run_dir / f"{prefix}_{key}.png"
+                if vpath.exists():
+                    pick_key = f"{prefix}_{key}"
+                    label = f"{key}: \"{text_variants[key]}\""
+                    variant_cols_data.append((key, label, vpath, pick_key))
+
+            # If filtering, skip images with no picks
+            if filter_picked:
+                has_any_pick = any(picks.get(pk, False) for _, _, _, pk in variant_cols_data)
+                if not has_any_pick:
+                    continue
+
+            st.markdown(f"**#{idx_num}** — {desc}")
+
+            # Row 1: input + baseline
+            col1, col2 = st.columns(2)
+            if input_path.exists():
+                col1.image(str(input_path), caption="Input", use_container_width=True)
+            col2.image(str(baseline_path), caption="Baseline (image only)", use_container_width=True)
+
+            # Row 2: text variants in groups of 3, with optional checkboxes
+            display_variants = variant_cols_data
+            if filter_picked:
+                display_variants = [(k, l, v, pk) for k, l, v, pk in variant_cols_data if picks.get(pk, False)]
+
+            if display_variants:
+                for chunk_start in range(0, len(display_variants), 3):
+                    chunk = display_variants[chunk_start:chunk_start + 3]
+                    cols = st.columns(len(chunk))
+                    for col, (key, label, vpath, pick_key) in zip(cols, chunk):
+                        is_picked = picks.get(pick_key, False)
+                        border = "3px solid #4CAF50" if is_picked else "none"
+                        col.markdown(
+                            f'<div style="border: {border}; border-radius: 4px; padding: 2px;">',
+                            unsafe_allow_html=True,
+                        )
+                        col.image(str(vpath), caption=label, use_container_width=True)
+                        col.markdown('</div>', unsafe_allow_html=True)
+                        if pick_mode:
+                            if col.checkbox("worked", value=is_picked, key=pick_key):
+                                picks[pick_key] = True
+                            else:
+                                picks[pick_key] = False
+
+            st.divider()
+
+        # Auto-save picks on any change
+        if picks:
+            picks_path.write_text(json.dumps(picks, indent=2))
+
+    elif is_multi:
         # Render with original indices
         n = meta["n"]
         entries = meta.get("entries", [])

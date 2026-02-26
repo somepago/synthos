@@ -193,6 +193,10 @@ def main():
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--num_steps", type=int, default=None)
     parser.add_argument("--cfg_scale", type=float, default=None)
+    parser.add_argument("--max_pixels", type=int, default=768*768,
+                        help="Max pixels for VL image encoding (controls token count / variation strength)")
+    parser.add_argument("--n_samples", type=int, default=None,
+                        help="Process only first N images/prompts (default: all)")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dtype", type=str, default="bfloat16")
 
@@ -210,6 +214,13 @@ def main():
     # Parse inputs
     prompts = parse_prompts(args.prompt)
     images = parse_images(args.image)
+
+    # Truncate to --n_samples if specified
+    if args.n_samples is not None:
+        if prompts:
+            prompts = prompts[:args.n_samples]
+        if images:
+            images = images[:args.n_samples]
 
     # Determine batch vs single mode
     n_prompts = len(prompts) if prompts else 0
@@ -322,10 +333,11 @@ def main():
         if image_path and text_encoder == "qwen3vl":
             # i2i
             edit_img = Image.open(image_path).convert("RGB")
-            prompt_embeds = encode_image_vl(pipe, edit_img, pipe.device)
+            prompt_embeds = encode_image_vl(pipe, edit_img, pipe.device,
+                                            max_pixels=args.max_pixels)
             image = denoise_loop(pipe, prompt_embeds, h, w, args.seed,
                                  num_steps, cfg_scale)
-            print(f"i2i: {h}x{w}, steps={num_steps}, cfg={cfg_scale}")
+            print(f"i2i: {h}x{w}, steps={num_steps}, cfg={cfg_scale}, max_pixels={args.max_pixels}")
 
             # Also do t2i if prompt provided
             if prompt:
@@ -388,7 +400,8 @@ def main():
                 input_resized = input_img.resize((w, h), Image.LANCZOS)
                 input_resized.save(output_dir / f"input_{i:03d}.png")
 
-                prompt_embeds = encode_image_vl(pipe, input_img, pipe.device)
+                prompt_embeds = encode_image_vl(pipe, input_img, pipe.device,
+                                                max_pixels=args.max_pixels)
                 image = denoise_loop(pipe, prompt_embeds, h, w, args.seed,
                                      num_steps, cfg_scale)
                 image.save(output_dir / f"i2i_{i:03d}.png")
@@ -431,6 +444,7 @@ def main():
         "seed": args.seed,
         "height": args.height,
         "width": args.width,
+        "max_pixels": args.max_pixels,
         "has_t2i": has_t2i,
         "has_i2i": has_i2i,
         "has_input": has_input,

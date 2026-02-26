@@ -61,9 +61,11 @@ Blend modes:
 | `--model` | `z-image-turbo` (default) or `z-image-base` |
 | `--text_encoder` | `qwen3vl` (default) or `qwen3` |
 | `--seed` | Random seed (default: 42) |
-| `--height/--width` | Output resolution (default: 512) |
+| `--height/--width` | Output resolution (default: 1024) |
 | `--num_steps` | Denoising steps (default: model-specific) |
 | `--cfg_scale` | Classifier-free guidance scale |
+| `--max_pixels` | Max pixels for VL image encoding (default: 768*768). Controls token count / variation strength |
+| `--n_samples` | Process only first N images/prompts (default: all) |
 | `--metrics` | Compute HPSv2.1, CLIP score, DINOv2 sim |
 | `--blend_mode` | `concat`, `avg`, `scale` (multi-image only) |
 | `--alpha` | First image weight for avg/scale (default: 0.5) |
@@ -78,12 +80,32 @@ bash run_baselines.sh 2>&1 | tee outputs/baselines.log
 
 See `run_baselines.sh` for full list. Includes i2i/t2i on 84 eval images, composition with dense/light prompts, caption-drop ablation, and alpha sweeps for B5/B6.
 
+### Variation strength (max_pixels sweep)
+
+```bash
+# Run all 6 levels on first 20 eval images
+bash run_variations.sh
+
+# Single image at specific token count
+python inference.py --image photo.jpg --max_pixels 65536  # strong variation
+python inference.py --image photo.jpg --max_pixels 589824 # subtle variation
+```
+
+### Text-guided variations
+
+```bash
+python run_text_variations.py            # 12 images x 9 text prompts
+python run_text_variations.py --dry_run  # preview plan
+```
+
 ## Project Structure
 
 ```
 inference.py                    # Unified t2i + i2i inference (single + batch)
 inference_multi_image.py        # Multi-image composition inference
 run_baselines.sh                # Overnight baseline runs (resumable)
+run_variations.sh               # Variation strength ablation (max_pixels sweep)
+run_text_variations.py          # Text-guided variation ablation
 train_stage1_projection.py      # Stage 1 SigLip projection training
 src/
   diffusion.py                  # Encoding functions (VL, interleaved, weighted avg/scale)

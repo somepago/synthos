@@ -447,15 +447,68 @@ Script: `run_1024_baselines.sh`
 
 **Conclusion**: The 512px artifacts were NOT caused by our VL splice encoding — they were purely a resolution issue. The model produces clean output at its native 1024px training resolution. Our VL pipeline introduces no quality degradation compared to the native Qwen3 text encoder path.
 
+### Variation Strength Ablation (max_pixels sweep)
+
+Tested how VL token count (controlled via `max_pixels`) affects i2i variation strength. Lower `max_pixels` = fewer visual tokens = coarser representation = stronger variation from the original.
+
+**Token counts** (measured on image 000, plumber illustration):
+
+| Level | max_pixels | Tokens | Expected |
+|-------|-----------|--------|----------|
+| `very_strong` | 16,384 (128x128) | 82 | Very abstract |
+| `strong` | 65,536 (256x256) | 82 | Loose interpretation |
+| `medium` | 147,456 (384x384) | 153 | Balanced variation |
+| `default` | 262,144 (512x512) | 280 | Moderate fidelity |
+| `subtle` | 589,824 (768x768) | 582 | Close to original |
+| `very_subtle` | 802,816 (896x896) | 760 | Near-faithful |
+
+Note: `very_strong` and `strong` both produce 82 tokens — Qwen3-VL has a minimum patch count floor.
+
+**Run**: 20 images x 6 levels = 120 generations. Outputs: `outputs/baselines_feb25/vary_{level}/`
+
+Script: `run_variations.sh` (uses `--max_pixels` and `--n_samples` flags added to `inference.py`)
+
+### Text-Guided Variation Ablation
+
+Tested whether adding text alongside the image via `encode_interleaved_vl()` can steer the output.
+
+**Token counts at medium (384x384)**:
+- Image-only: **153 tokens**
+- Image + "wearing a top hat": **158 tokens** (5 text tokens added)
+- Text-only "wearing a top hat": **13 tokens**
+- Empty text: **8 tokens**
+
+**Key finding: text is ~3% of the conditioning sequence** — 5 tokens vs 153 image tokens. This is why text guidance barely works zero-shot.
+
+**Prompts tested** (9 per image, 12 images = 108 variants):
+- Style transfer: "in watercolor style", "as a pencil sketch", "in cyberpunk neon style", "as an oil painting"
+- Scene modification: "at sunset", "in winter with snow", "underwater"
+- Subject alteration: "but as a cat", "wearing a top hat"
+
+**Results**: 3/108 somewhat worked (~3% hit rate):
+- `000_sunset` — plumber illustration "at sunset" (color/lighting shift)
+- `011_top_hat` — rhino pencil sketch "wearing a top hat"
+- `015_top_hat` — orange fashion photo "wearing a top hat"
+- `017_top_hat` — face closeup "wearing a top hat"
+
+**Pattern**: Only additive/concrete modifications worked ("top hat" = single object overlay, "sunset" = color shift). Style transfers (watercolor, pencil, cyberpunk) and scene changes (winter, underwater) all failed — these require global changes that 5 text tokens can't override against 153 image tokens.
+
+**Conclusion**: Zero-shot text-guided variation doesn't work with the current architecture because text tokens are massively outnumbered by visual tokens. Finetuning needed to amplify text influence.
+
+Output: `outputs/baselines_feb25/vary_text/`, picks in `picks.json`.
+
+Script: `run_text_variations.py`
+
 ### TODOs
 - [x] **Evaluate t2i vs i2i quality** — `run_eval_40.py`, results in `outputs/eval_40_vl/`
 - [x] **Unified inference CLI** — `inference.py` (t2i + i2i, single + batch, metrics)
 - [x] **Multi-image inference** — `inference_multi_image.py` with blend modes
 - [x] **Composition baselines** — B3/B5/B6 with alpha sweeps, light prompts, caption-drop ablation
-- [ ] Investigate `max_pixels` effect: old `test_qwen3vl.py` resized to 512x512 before encoding (~334 visual tokens), current code caps at 768*768 (~500-750 tokens). Lower token count may produce cleaner outputs — test 512*512 cap vs 768*768.
+- [x] **Variation strength ablation** — `run_variations.sh`, 6 max_pixels levels x 20 images
+- [x] **Text-guided variation ablation** — `run_text_variations.py`, 9 text prompts x 12 images
 - [ ] Z-Image Base model for training — may converge better with MSE loss since it's not distilled
 - [ ] Add relaion-pop dataset (`/home/gnan/projects/data/datasets/laion__relaion-pop/`) — higher resolution images
 - [ ] GRPO with LPIPS + SSIM + DINOv2 reward
-- [ ] Text-guided composition training: finetune (LoRA?) to make text instructions between images actually control composition
+- [ ] Text-guided variation finetuning — need to amplify text token influence (5 tokens vs 153 image tokens at medium)
 - [ ] Multi-image composition as a research direction — zero-shot compositing puts elements from multiple images into one scene but doesn't truly blend styles/concepts. Training needed for real fusion.
 - [ ] Analyze baseline results — compare B3 vs B5 vs B6, effect of alpha, text vs no-text
