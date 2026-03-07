@@ -1,42 +1,33 @@
 #!/usr/bin/env python3
 """
-DiffusionNFT training for text-guided image composition via VL splice.
+DiffusionNFT training for coherent multi-image blending via VL splice.
 
 Uses DiffusionNFT (arxiv.org/abs/2509.16117) — reward-weighted velocity matching
-on the forward diffusion process. Unlike naive GRPO that backprops through the
-full 8-step denoising chain (huge activation memory), DiffusionNFT only needs
-ONE DiT forward+backward per training sample.
+on the forward diffusion process. Only needs ONE DiT forward+backward per sample
+(vs 8x for naive GRPO backprop through denoising chain).
+
+Objective: given two input images, generate a coherent "surprise" blend. The VLM
+reward judges whether the output is visually plausible (reasonable proportions,
+consistent style, no artifacts) rather than matching a specific text prompt.
 
 Trains:
-  1. ConditioningAdapter: transformer block(s) on VL prompt_embeds (2560-dim)
+  1. CompositionModule: transformer block(s) on VL prompt_embeds (2560-dim)
   2. LoRA on DiT Linear layers (manual, no HuggingFace/peft)
 
-Training loop:
-  1. Sample composition entry: [img1, prompt, img2]
-  2. Encode via VL splice + adapter → prompt_embeds
-  3. Generate K images (full 8-step rollout, no grad)
-  4. Score with VLM reward (Qwen3-VL-8B via vLLM)
-  5. Normalize rewards to [0,1]
-  6. For each generated image:
-     - VAE encode → z_0, forward diffuse → z_t = (1-t)*z_0 + t*ε
-     - v_θ = current model prediction (single DiT forward, WITH grad)
-     - v_old = EMA model prediction (single DiT forward, no grad)
-     - v_+ = (1-β)*v_old + β*v_θ  (positive implicit policy)
-     - v_- = (1+β)*v_old - β*v_θ  (negative implicit policy)
-     - Loss = r*||v_+ - v_target||² + (1-r)*||v_- - v_target||²
-  7. Backward + update + EMA
+Rollout filtering: skips gradient updates when max(scores) < threshold — if all
+rollouts are bad, there's no positive/negative contrast signal to learn from.
 
 Dataset format (composition.jsonl, one JSON array per line):
-    [{"img": "001532193.jpg"}, {"img": "005112355.jpg"}, {"prompt": "A film crew shooting..."}]
-    Images are loaded from images/ directory alongside the JSONL file.
+    [{"img": "001532193.jpg"}, {"img": "005112355.jpg"}]
+    [{"img": "001532193.jpg"}, {"img": "005112355.jpg"}, {"prompt": "optional text"}]
 
 Usage:
     # Start vLLM reward server first:
     # python -m vllm.entrypoints.openai.api_server \\
     #     --model Qwen/Qwen3-VL-8B-Instruct --max-model-len 4096 --port 8100
 
-    python train_grpo.py --dataset /path/to/composition.jsonl --reward_url http://localhost:8100
-    python train_grpo.py --dataset /path/to/composition.jsonl --dry_run  # test pipeline
+    python train_diffusionnft.py --dataset /path/to/composition.jsonl --reward_url http://localhost:8100
+    python train_diffusionnft.py --dataset /path/to/composition.jsonl --dry_run
 """
 
 from src import env_setup  # noqa: F401
@@ -72,17 +63,27 @@ from src.diffusion import (
 )
 
 VLM_JUDGE_PROMPT = (
-    "Score from 0 to 10 based on these criteria:\n"
-    "- Does the result follow the composition prompt's instruction?\n"
-    "- Does it take the RIGHT elements from each reference as the prompt specifies?\n"
-    "- Does it avoid leaking UNWANTED elements from either reference?\n"
-    "- Is the result a coherent single image, not a collage or split screen?\n"
-    "- Is it visually plausible and free of major artifacts?\n\n"
-    "Scoring guide:\n"
-    "9-10: Prompt followed accurately, correct elements from each reference, coherent output\n"
-    "6-8: Right idea but imperfect — minor unwanted leaks, partial transfer, or small artifacts\n"
-    "3-5: Recognizable attempt but major issues — wrong elements used, heavy leaks, or incoherent\n"
-    "0-2: Complete failure — ignored inputs, garbled output, or just copied one reference\n\n"
+    "You are a strict judge evaluating an AI-generated image that was created by "
+    "blending two reference images.\n\n"
+    "A GOOD blend takes the subject/content from one reference and the style/aesthetic "
+    "from the other, producing a single coherent image. A BAD blend just pastes both "
+    "subjects together, creates floating/disjointed objects, or produces artifacts.\n\n"
+    "Score from 1 to 10. Be HARSH — most blends should score 3-6.\n\n"
+    "SEVERE penalties (score 1-3):\n"
+    "- Floating or disjointed objects that don't belong in the scene\n"
+    "- Obvious collage effect — elements look pasted, not integrated\n"
+    "- Broken anatomy, deformed faces, extra limbs\n"
+    "- Both subjects just placed side by side or overlapping randomly\n"
+    "- Incoherent scene that makes no visual sense\n\n"
+    "Medium penalties (score 4-6):\n"
+    "- Both subjects appear but are somewhat integrated into one scene\n"
+    "- Inconsistent lighting or color palette between elements\n"
+    "- Minor artifacts or slight style mismatch\n\n"
+    "High scores (score 7-8):\n"
+    "- Clear subject from one reference rendered in the style of the other\n"
+    "- OR both elements genuinely fused into one coherent scene/concept\n"
+    "- Consistent style throughout, no obvious artifacts\n\n"
+    "Score 9-10: Reserved for exceptional results that look professionally made\n\n"
     "Respond with ONLY a single integer."
 )
 
@@ -99,7 +100,7 @@ class CompositionDataset:
 
     def __init__(self, jsonl_path: str):
         self.jsonl_path = Path(jsonl_path)
-        self.image_dir = self.jsonl_path.parent / "images"
+        self.base_dir = self.jsonl_path.parent
         self.entries = []
         with open(self.jsonl_path) as f:
             for line in f:
@@ -122,7 +123,20 @@ class CompositionDataset:
 
         for item in entry:
             if "img" in item:
-                img_path = self.image_dir / item["img"]
+                # Try path as-is first (absolute or relative to CWD),
+                # then relative to JSONL parent dir, then relative to
+                # images/ subdir alongside JSONL
+                img_name = item["img"]
+                for candidate in [
+                    Path(img_name),
+                    self.base_dir / img_name,
+                    self.base_dir / "images" / img_name,
+                ]:
+                    if candidate.exists():
+                        img_path = candidate
+                        break
+                else:
+                    img_path = self.base_dir / "images" / img_name
                 img = Image.open(img_path).convert("RGB")
                 images.append(img)
                 content_list.append({"img": img})
@@ -137,11 +151,11 @@ class CompositionDataset:
 
 
 # =============================================================================
-# Conditioning Adapter
+# Composition Module
 # =============================================================================
 
-class AdapterBlock(nn.Module):
-    """Single transformer block for conditioning adaptation.
+class CompositionBlock(nn.Module):
+    """Single transformer block for multi-image composition.
 
     Pre-norm architecture with self-attention + FFN.
     Zero-initialized output projections → starts as identity.
@@ -170,12 +184,13 @@ class AdapterBlock(nn.Module):
         return x
 
 
-class ConditioningAdapter(nn.Module):
-    """Trainable transformer block(s) on VL prompt embeddings.
+class CompositionModule(nn.Module):
+    """Trainable transformer block(s) that learn to compose multi-image
+    VL embeddings into a coherent conditioning signal for the DiT.
 
     Sits between encode_interleaved_vl() output (L, 2560) and the DiT's
-    frozen cap_embedder. Self-attention lets text tokens attend to image
-    tokens and learn to amplify the text signal.
+    frozen cap_embedder. The VL model encodes both images with cross-attention
+    but doesn't know what the DiT needs. This module learns the transformation.
 
     Zero-initialized → acts as identity at start of training.
     """
@@ -184,7 +199,7 @@ class ConditioningAdapter(nn.Module):
                  ffn_mult: float = 4.0):
         super().__init__()
         self.layers = nn.ModuleList([
-            AdapterBlock(dim, n_heads, ffn_mult) for _ in range(n_layers)
+            CompositionBlock(dim, n_heads, ffn_mult) for _ in range(n_layers)
         ])
 
     def forward(self, x):
@@ -333,39 +348,37 @@ class VLMRewardClient:
         self.model = model
         self.url = f"{self.base_url}/v1/chat/completions"
 
-    def _build_message(self, ref_images: list[Image.Image], prompt: str,
+    def _build_message(self, ref_images: list[Image.Image],
                        output_img: Image.Image) -> list:
         content = []
-        # Show reference images
-        content.append({"type": "text", "text": "You are evaluating an image composition result.\n"})
+        content.append({"type": "text", "text": "Reference images used as input:\n"})
         for i, ref in enumerate(ref_images):
-            content.append({"type": "text", "text": f"Reference image {i+1}:"})
+            content.append({"type": "text", "text": f"Reference {i+1}:"})
             content.append({"type": "image_url", "image_url": {
                 "url": f"data:image/png;base64,{pil_to_base64(ref)}"}})
 
-        # Show prompt and output
-        content.append({"type": "text", "text": f'\nComposition prompt: "{prompt}"\n\nGenerated result:'})
+        content.append({"type": "text", "text": "\nGenerated result:"})
         content.append({"type": "image_url", "image_url": {
             "url": f"data:image/png;base64,{pil_to_base64(output_img)}"}})
 
         content.append({"type": "text", "text": VLM_JUDGE_PROMPT})
         return [{"role": "user", "content": content}]
 
-    def score_batch(self, ref_images_list: list, prompts: list,
+    def score_batch(self, ref_images_list: list,
                     output_images: list) -> list[float]:
         """Score a batch. ref_images_list[i] is a list of reference images for sample i."""
         scores = []
-        for refs, prompt, out in zip(ref_images_list, prompts, output_images):
+        for refs, out in zip(ref_images_list, output_images):
             try:
-                score = self._score_single(refs, prompt, out)
+                score = self._score_single(refs, out)
             except Exception as e:
                 print(f"  VLM reward error: {e}, defaulting to 5.0")
                 score = 5.0
             scores.append(score)
         return scores
 
-    def _score_single(self, ref_images, prompt, output_img) -> float:
-        messages = self._build_message(ref_images, prompt, output_img)
+    def _score_single(self, ref_images, output_img) -> float:
+        messages = self._build_message(ref_images, output_img)
         resp = requests.post(self.url, json={
             "model": self.model,
             "messages": messages,
@@ -421,7 +434,7 @@ class PerceptualReward:
             ])
 
     @torch.no_grad()
-    def score_batch(self, ref_images_list: list, prompts: list,
+    def score_batch(self, ref_images_list: list,
                     output_images: list) -> list[float]:
         """Score based on perceptual similarity to first reference image."""
         self._load_lpips()
@@ -450,25 +463,13 @@ class PerceptualReward:
 # DiffusionNFT Trainer (reward-weighted velocity matching on forward process)
 # =============================================================================
 
-class GRPOTrainerVL:
-    """DiffusionNFT training for text-guided image composition via VL splice.
+class DiffusionNFTTrainer:
+    """DiffusionNFT training for coherent multi-image blending via VL splice.
 
-    Instead of backpropagating through the full denoising chain (expensive),
-    DiffusionNFT operates on the forward diffusion process:
+    Objective: generate coherent "surprise" blends from two input images.
+    VLM reward judges visual plausibility, not text-prompt adherence.
 
-    1. Generate K images from current model (no grad, full 8-step rollout)
-    2. Score with VLM reward → normalize to [0,1]
-    3. For each generated image x_0:
-       - Forward diffuse to random timestep: z_t = (1-t)*z_0 + t*ε
-       - Velocity target: v = ε - z_0
-       - Get v_θ from current model (single DiT forward, WITH grad)
-       - Get v_old from EMA/old model (single DiT forward, no grad)
-       - Implicit positive: v_+ = (1-β)*v_old + β*v_θ
-       - Implicit negative: v_- = (1+β)*v_old - β*v_θ
-       - Loss = r*||v_+ - v||² + (1-r)*||v_- - v||²
-    4. Single backward pass → update adapter + LoRA
-
-    Memory: only 1 DiT forward+backward per sample (vs 8× per sample in naive GRPO).
+    Skips gradient updates when max(scores) < min_reward_threshold (no signal).
 
     Reference: DiffusionNFT (arxiv.org/abs/2509.16117)
     """
@@ -489,6 +490,8 @@ class GRPOTrainerVL:
         lr: float = 1e-5,
         beta_nft: float = 0.1,
         ema_decay: float = 0.99,
+        min_reward_threshold: float = 3.0,
+        cond_noise_std: float = 0.1,
         # VL encoding
         max_pixels: int = 384 * 384,
         # Generation
@@ -499,6 +502,8 @@ class GRPOTrainerVL:
         self.group_size = group_size
         self.beta_nft = beta_nft
         self.ema_decay = ema_decay
+        self.min_reward_threshold = min_reward_threshold
+        self.cond_noise_std = cond_noise_std
         self.max_pixels = max_pixels
         self.height = height
         self.width = width
@@ -512,13 +517,13 @@ class GRPOTrainerVL:
                                   text_encoder="qwen3vl")
 
         # Conditioning adapter (trainable)
-        print(f"Creating ConditioningAdapter: layers={adapter_layers}, heads={adapter_heads}")
-        self.adapter = ConditioningAdapter(
+        print(f"Creating CompositionModule: layers={adapter_layers}, heads={adapter_heads}")
+        self.composer = CompositionModule(
             dim=2560, n_heads=adapter_heads, n_layers=adapter_layers,
             ffn_mult=adapter_ffn_mult,
         ).to(device=device, dtype=self.dtype)
-        adapter_params = sum(p.numel() for p in self.adapter.parameters())
-        print(f"  Adapter params: {adapter_params:,}")
+        adapter_params = sum(p.numel() for p in self.composer.parameters())
+        print(f"  CompositionModule params: {adapter_params:,}")
 
         # LoRA on DiT (manual, no peft)
         print(f"Injecting LoRA: rank={lora_rank}, alpha={lora_alpha}")
@@ -533,7 +538,7 @@ class GRPOTrainerVL:
             self.ema_state[k] = v.detach().clone()
 
         # Optimizer over adapter + LoRA params
-        trainable = list(self.adapter.parameters()) + lora_params
+        trainable = list(self.composer.parameters()) + lora_params
         self.optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.01)
 
         # Scheduler config (for rollout generation)
@@ -546,7 +551,7 @@ class GRPOTrainerVL:
     def _trainable_params_dict(self) -> dict:
         """Get all trainable params as a flat dict (adapter + LoRA)."""
         d = {}
-        for k, v in self.adapter.named_parameters():
+        for k, v in self.composer.named_parameters():
             d[f"adapter.{k}"] = v
         for name, module in self.pipe.dit.named_modules():
             if isinstance(module, LoRALinear):
@@ -587,7 +592,7 @@ class GRPOTrainerVL:
             prompt_embeds = encode_interleaved_vl(
                 self.pipe, content_list, self.device, max_pixels=self.max_pixels
             )
-        prompt_embeds = self.adapter(prompt_embeds)
+        prompt_embeds = self.composer(prompt_embeds)
         return prompt_embeds
 
     def _rollout_no_grad(self, noise, prompt_embeds):
@@ -656,128 +661,120 @@ class GRPOTrainerVL:
         """
         K = self.group_size
         ref_images = sample["images"]
-        prompt = sample["prompt"]
+        prompt = sample.get("prompt", "")
         content_list = sample["content_list"]
 
         # --- Phase 1: Generate K images (no grad) ---
-        import sys
-        print(f"  [train_step] Phase 1: encoding conditioning...", flush=True)
         with torch.no_grad():
             prompt_embeds_frozen = encode_interleaved_vl(
                 self.pipe, content_list, self.device, max_pixels=self.max_pixels
             )
-            prompt_embeds_nograd = self.adapter(prompt_embeds_frozen)
-        print(f"  [train_step] Conditioning encoded: {prompt_embeds_frozen.shape}", flush=True)
+            prompt_embeds_nograd = self.composer(prompt_embeds_frozen)
 
         images = []
         latents_z0 = []
         for k in range(K):
-            print(f"  [train_step] Rollout {k+1}/{K}...", flush=True)
-            sys.stdout.flush()
             seed = random.randint(0, 2**32 - 1)
             shape = get_latent_shape(self.height, self.width)
             noise = generate_noise(seed, shape, self.device, self.dtype)
 
-            img = self._rollout_no_grad(noise, prompt_embeds_nograd)
-            images.append(img)
-            print(f"  [train_step] Rollout {k+1}/{K} done, VAE encoding...", flush=True)
+            # Add per-rollout noise to conditioning for diversity
+            if self.cond_noise_std > 0:
+                cond_noise = torch.randn_like(prompt_embeds_nograd) * self.cond_noise_std
+                rollout_embeds = prompt_embeds_nograd + cond_noise
+            else:
+                rollout_embeds = prompt_embeds_nograd
 
-            # VAE encode generated image back to latent z_0
+            img = self._rollout_no_grad(noise, rollout_embeds)
+            images.append(img)
+
             with torch.no_grad():
                 z_0 = encode_image_vae(self.pipe, img)
             latents_z0.append(z_0)
-            print(f"  [train_step] Rollout {k+1}/{K} VAE done: {z_0.shape}", flush=True)
 
         # --- Phase 2: Score with reward ---
-        print(f"  [train_step] Phase 2: scoring {K} images with reward...", flush=True)
-        scores = reward_fn.score_batch(
-            [ref_images] * K,
-            [prompt] * K,
-            images,
-        )
+        scores = reward_fn.score_batch([ref_images] * K, images)
         rewards_raw = torch.tensor(scores, dtype=torch.float32)
 
-        # Normalize rewards to [0,1] (DiffusionNFT normalization)
         mean_r = rewards_raw.mean()
         std_r = rewards_raw.std() + 1e-8
+
+        # Rollout filtering: skip gradient if all scores below threshold
+        skipped = False
+        if rewards_raw.max().item() < self.min_reward_threshold:
+            skipped = True
+            rewards_norm = torch.zeros(K)
+            return {
+                "loss": 0.0, "loss_pos": 0.0, "loss_neg": 0.0,
+                "mean_reward": mean_r.item(), "std_reward": std_r.item(),
+                "min_reward": rewards_raw.min().item(),
+                "max_reward": rewards_raw.max().item(),
+                "rewards_norm": rewards_norm.tolist(),
+                "scores": scores, "images": images,
+                "ref_images": ref_images, "prompt": prompt,
+                "adapter_grad_norm": 0.0, "lora_grad_norm": 0.0,
+                "skipped": True,
+            }
+
+        # Normalize rewards to [0,1] (DiffusionNFT normalization)
         rewards_norm = 0.5 + 0.5 * torch.clamp((rewards_raw - mean_r) / std_r, -1.0, 1.0)
 
         # --- Phase 3: DiffusionNFT gradient step ---
-        print(f"  [train_step] Phase 3: gradient step, scores={scores}", flush=True)
-
         loss_total_val = 0.0
         loss_pos_total = 0.0
         loss_neg_total = 0.0
         beta = self.beta_nft
 
-        # Gradient accumulation: backward after EACH sample to free
-        # activation memory between DiT forward passes.
         self.optimizer.zero_grad()
 
         for k in range(K):
             r = rewards_norm[k].item()
             z_0 = latents_z0[k].detach()
 
-            # Random timestep t in [0, 1)
             t = random.uniform(0.05, 0.95)
             epsilon = torch.randn_like(z_0)
 
             # Forward diffuse: z_t = (1-t)*z_0 + t*ε (rectified flow)
             z_t = ((1 - t) * z_0 + t * epsilon).detach()
-
-            # Velocity target: v = ε - z_0
             v_target = (epsilon - z_0).detach()
-
-            # Timestep in scheduler scale (0-1000)
             t_scaled = torch.tensor([t * SCHEDULER_SCALE], dtype=self.dtype, device=self.device)
 
-            print(f"  [Phase3] sample {k}: t={t:.3f}, r={r:.3f}, computing v_theta...", flush=True)
-
-            # Re-encode conditioning per sample (fresh graph each time)
+            # Re-encode conditioning per sample (fresh computation graph)
             prompt_embeds_k = self._encode_conditioning(content_list)
 
-            # v_θ: current model prediction (WITH grad through adapter + LoRA)
-            # Gradient checkpointing: recompute activations during backward
-            # instead of storing them — critical for fitting in memory
+            # v_θ with gradient checkpointing
             v_theta = self._predict_velocity(z_t, t_scaled, prompt_embeds_k,
                                              use_grad_ckpt=True)
-            print(f"  [Phase3] sample {k}: v_theta done", flush=True)
 
-            # v_old = v_theta.detach() — at early training EMA ≈ current weights.
-            # This avoids a second DiT forward pass and weight swapping.
+            # v_old ≈ v_theta.detach() (valid early in training when EMA ≈ current)
             v_old = v_theta.detach()
 
             # Implicit parameterization (DiffusionNFT)
             v_pos = (1 - beta) * v_old + beta * v_theta
             v_neg = (1 + beta) * v_old - beta * v_theta
 
-            # Contrastive loss (divided by K for gradient accumulation)
             loss_pos = r * ((v_pos - v_target) ** 2).mean() / K
             loss_neg = (1 - r) * ((v_neg - v_target) ** 2).mean() / K
             sample_loss = loss_pos + loss_neg
 
             # Backward immediately — frees activation memory before next sample
             sample_loss.backward()
-            print(f"  [Phase3] sample {k}: loss_pos={loss_pos.item()*K:.4f}, loss_neg={loss_neg.item()*K:.4f}, backward done", flush=True)
 
             loss_total_val += sample_loss.item()
             loss_pos_total += loss_pos.item() * K
             loss_neg_total += loss_neg.item() * K
 
-        print(f"  [Phase3] Total loss={loss_total_val:.4f}, stepping optimizer...", flush=True)
-        all_trainable = list(self.adapter.parameters()) + [
+        all_trainable = list(self.composer.parameters()) + [
             p for p in self.pipe.dit.parameters() if p.requires_grad
         ]
         torch.nn.utils.clip_grad_norm_(all_trainable, max_norm=1.0)
         self.optimizer.step()
-
-        # EMA update
         self._update_ema()
 
         # Grad norms for monitoring
         adapter_grad_norm = 0.0
         lora_grad_norm = 0.0
-        for p in self.adapter.parameters():
+        for p in self.composer.parameters():
             if p.grad is not None:
                 adapter_grad_norm += p.grad.data.norm(2).item() ** 2
         for p in get_lora_params(self.pipe.dit):
@@ -795,17 +792,16 @@ class GRPOTrainerVL:
             "min_reward": rewards_raw.min().item(),
             "max_reward": rewards_raw.max().item(),
             "rewards_norm": rewards_norm.tolist(),
-            "scores": scores,
-            "images": images,
-            "ref_images": ref_images,
-            "prompt": prompt,
+            "scores": scores, "images": images,
+            "ref_images": ref_images, "prompt": prompt,
             "adapter_grad_norm": adapter_grad_norm,
             "lora_grad_norm": lora_grad_norm,
+            "skipped": False,
         }
 
     def save_checkpoint(self, path: str, step: int):
         """Save adapter + LoRA + EMA + optimizer state."""
-        adapter_state = {k: v.cpu() for k, v in self.adapter.state_dict().items()}
+        adapter_state = {k: v.cpu() for k, v in self.composer.state_dict().items()}
         lora_state = {k: v.cpu() for k, v in get_lora_state_dict(self.pipe.dit).items()}
         ema_state = {k: v.cpu() for k, v in self.ema_state.items()}
 
@@ -821,7 +817,7 @@ class GRPOTrainerVL:
     def load_checkpoint(self, path: str):
         """Load adapter + LoRA + EMA weights."""
         ckpt = torch.load(path, map_location=self.device, weights_only=True)
-        self.adapter.load_state_dict(ckpt["adapter_state_dict"])
+        self.composer.load_state_dict(ckpt["adapter_state_dict"])
         load_lora_state_dict(self.pipe.dit, ckpt["lora_state_dict"])
         if "ema_state" in ckpt:
             for k, v in ckpt["ema_state"].items():
@@ -838,7 +834,7 @@ class GRPOTrainerVL:
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="GRPO for text-guided variations (VL splice)")
+    parser = argparse.ArgumentParser(description="DiffusionNFT for coherent image blending (VL splice)")
 
     # Data
     parser.add_argument("--dataset", type=str, required=True,
@@ -860,6 +856,10 @@ def main():
                         help="DiffusionNFT guidance strength β (default: 0.1)")
     parser.add_argument("--ema_decay", type=float, default=0.99,
                         help="EMA decay for old policy weights (default: 0.99)")
+    parser.add_argument("--min_reward_threshold", type=float, default=3.0,
+                        help="Skip gradient if max(scores) < this (default: 3.0)")
+    parser.add_argument("--cond_noise_std", type=float, default=0.1,
+                        help="Gaussian noise std added to conditioning per rollout for diversity (default: 0.1)")
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--eval_every", type=int, default=25)
     parser.add_argument("--save_every", type=int, default=100)
@@ -885,7 +885,7 @@ def main():
     # Misc
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dtype", type=str, default="bfloat16")
-    parser.add_argument("--output_dir", type=str, default="outputs/grpo_vl")
+    parser.add_argument("--output_dir", type=str, default="outputs/diffnft")
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint path to resume from")
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--dry_run", action="store_true", help="Test pipeline without training")
@@ -924,13 +924,15 @@ def main():
         print("Using perceptual reward (LPIPS + DINOv2)")
 
     # Init trainer
-    trainer = GRPOTrainerVL(
+    trainer = DiffusionNFTTrainer(
         device=args.device, dtype=args.dtype,
         lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,
         adapter_layers=args.adapter_layers, adapter_heads=args.adapter_heads,
         adapter_ffn_mult=args.adapter_ffn_mult,
         group_size=args.group_size, lr=args.lr,
         beta_nft=args.beta_nft, ema_decay=args.ema_decay,
+        min_reward_threshold=args.min_reward_threshold,
+        cond_noise_std=args.cond_noise_std,
         max_pixels=args.max_pixels,
         height=args.height, width=args.width,
     )
@@ -973,7 +975,7 @@ def main():
         print(f"Velocity prediction shape: {v_pred.shape}, norm: {v_pred.norm().item():.2f}")
 
         if args.reward == "vlm" and reward_fn.health_check():
-            score = reward_fn.score_batch([sample["images"]], [sample["prompt"]], [out_img])
+            score = reward_fn.score_batch([sample["images"]], [out_img])
             print(f"VLM reward: {score[0]:.1f}/10")
 
         print("Dry run complete.")
@@ -982,7 +984,7 @@ def main():
     # Init wandb
     use_wandb = not args.no_wandb
     if use_wandb:
-        wandb.init(project="synthos-grpo", config=vars(args), dir=str(run_dir))
+        wandb.init(project="synthos-diffnft", config=vars(args), dir=str(run_dir))
 
     # Memory kill switch
     mem_limit = args.mem_limit
@@ -1000,18 +1002,23 @@ def main():
 
     # Training loop
     print(f"\nStarting DiffusionNFT training: {args.steps} steps, K={args.group_size}, β={args.beta_nft}")
+    print(f"Min reward threshold: {args.min_reward_threshold}")
     print(f"Output dir: {run_dir}")
     print(f"Memory kill switch: {mem_limit}%")
+
+    skipped_count = 0
 
     for step in tqdm(range(start_step + 1, args.steps + 1), desc="DiffNFT"):
         mem_pct = check_memory(step)
 
-        # Sample random composition entry
         sample = dataset.sample()
 
         t0 = time.time()
         metrics = trainer.train_step(sample, reward_fn)
         step_time = time.time() - t0
+
+        if metrics.get("skipped"):
+            skipped_count += 1
 
         # --- Wandb logging: scalars every step ---
         if use_wandb:
@@ -1019,6 +1026,8 @@ def main():
                 "train/loss": metrics["loss"],
                 "train/loss_pos": metrics["loss_pos"],
                 "train/loss_neg": metrics["loss_neg"],
+                "train/skipped": int(metrics.get("skipped", False)),
+                "train/skipped_total": skipped_count,
                 "reward/mean": metrics["mean_reward"],
                 "reward/std": metrics["std_reward"],
                 "reward/min": metrics["min_reward"],
@@ -1028,23 +1037,19 @@ def main():
                 "perf/step_time_s": step_time,
                 "perf/mem_pct": mem_pct,
             }
-            # Per-sample scores
             for i, s in enumerate(metrics["scores"]):
                 log_dict[f"reward/sample_{i}"] = s
-
             wandb.log(log_dict, step=step)
 
         # --- Console logging ---
-        if step % 5 == 0:
+        if step % 5 == 0 or metrics.get("skipped"):
             scores_str = ",".join(f"{s:.1f}" for s in metrics["scores"])
+            skip_tag = " SKIPPED" if metrics.get("skipped") else ""
             tqdm.write(
                 f"[{step}] loss={metrics['loss']:.4f} "
-                f"(+{metrics['loss_pos']:.4f}/-{metrics['loss_neg']:.4f}) "
-                f"reward={metrics['mean_reward']:.1f}±{metrics['std_reward']:.1f} "
-                f"scores=[{scores_str}] "
+                f"scores=[{scores_str}]{skip_tag} "
                 f"gnorm=A:{metrics['adapter_grad_norm']:.2f}/L:{metrics['lora_grad_norm']:.2f} "
-                f"t={step_time:.0f}s "
-                f"\"{metrics['prompt'][:35]}...\""
+                f"t={step_time:.0f}s skipped={skipped_count}/{step}"
             )
 
         # --- Eval: save rollouts + log images to wandb ---
@@ -1052,33 +1057,27 @@ def main():
             step_dir = run_dir / "samples" / f"step_{step:05d}"
             step_dir.mkdir(parents=True, exist_ok=True)
 
-            # Save to disk
             for i, ref in enumerate(metrics["ref_images"]):
                 ref.save(step_dir / f"ref_{i}.png")
             for i, img in enumerate(metrics["images"][:4]):
                 img.save(step_dir / f"output_{i}.png")
             with open(step_dir / "meta.json", "w") as f:
                 json.dump({
-                    "prompt": metrics["prompt"],
+                    "prompt": metrics.get("prompt", ""),
                     "scores": metrics["scores"],
                     "rewards_norm": metrics["rewards_norm"],
+                    "skipped": metrics.get("skipped", False),
                 }, f, indent=2)
 
-            # Log rollout images + refs to wandb
             if use_wandb:
                 wandb_images = []
-                # Reference images
                 for i, ref in enumerate(metrics["ref_images"]):
                     wandb_images.append(wandb.Image(ref, caption=f"ref_{i}"))
-                # Generated outputs with scores
                 for i, (img, score) in enumerate(zip(metrics["images"], metrics["scores"])):
                     wandb_images.append(wandb.Image(
                         img, caption=f"out_{i} score={score:.1f}"
                     ))
-                wandb.log({
-                    "rollouts": wandb_images,
-                    "rollout_prompt": wandb.Html(f"<b>{metrics['prompt']}</b>"),
-                }, step=step)
+                wandb.log({"rollouts": wandb_images}, step=step)
 
         # --- Checkpoint ---
         if step % args.save_every == 0:
@@ -1090,7 +1089,7 @@ def main():
     trainer.save_checkpoint(str(run_dir / "checkpoints" / "final.pt"), args.steps)
     if use_wandb:
         wandb.finish()
-    print(f"\nTraining complete. Outputs: {run_dir}")
+    print(f"\nTraining complete. Skipped {skipped_count}/{args.steps} steps. Outputs: {run_dir}")
 
 
 if __name__ == "__main__":

@@ -499,6 +499,202 @@ Output: `outputs/baselines_feb25/vary_text/`, picks in `picks.json`.
 
 Script: `run_text_variations.py`
 
+### Stage 2: GRPO for Text-Guided Variations
+
+**Goal**: Train the model to follow text instructions when generating image variations. Zero-shot text guidance failed (3/108 hit rate) because text tokens are ~3% of the conditioning sequence (5 tokens vs 153 image tokens at medium max_pixels).
+
+**Script**: `train_grpo.py`
+
+**What we train (two components)**:
+
+1. **ConditioningAdapter** — 1+ trainable transformer block(s) on VL prompt_embeds (2560-dim), inserted between `encode_interleaved_vl()` output and the DiT's frozen `cap_embedder`. Self-attention lets text tokens attend to image tokens and learn to amplify the text signal. Zero-initialized output projections → starts as identity (no disruption at init).
+   - Architecture: pre-norm transformer block (LayerNorm → MultiheadAttention → LayerNorm → FFN)
+   - Default: 1 layer, 16 heads, FFN mult 4.0
+   - Params: ~78M per layer (dim=2560)
+
+2. **LoRA on DiT** — low-rank adapters on DiT Linear layers. Manual implementation (no HuggingFace/peft). Each target `nn.Linear` gets wrapped in `LoRALinear`: `output = original(x) + x @ A @ B * (alpha/rank)`. A is kaiming-init, B is zero-init → zero LoRA contribution at start.
+   - Default: rank=32, targets all Linear layers with min dim ≥ 512 + adaLN_modulation
+
+**Data flow during training**:
+```
+Input Image + Text Instruction
+         │
+         ▼
+encode_interleaved_vl() (frozen VL model)
+         │ (L, 2560) — ~158 tokens at medium (153 image + 5 text)
+         ▼
+ConditioningAdapter (TRAINABLE) — self-attention on conditioning tokens
+         │ (L, 2560)
+         ▼
+DiT forward (LoRA TRAINABLE, base frozen):
+  cap_embedder (frozen) → context_refiner (frozen) → main transformer (LoRA)
+         │
+         ▼
+8-step denoising → output image
+         │
+         ▼
+VLM Reward (Qwen3-VL-8B via vLLM) — scores instruction-following + content preservation
+```
+
+**GRPO training loop**:
+1. Sample random (image, text_instruction) pair
+2. Encode via VL model + pass through adapter
+3. Generate K=4 images (no grad, for scoring)
+4. Score with VLM reward
+5. Compute group-relative advantages: `A_i = (r_i - mean(r)) / std(r)`
+6. For each sample: re-run with gradients, compute clipped surrogate loss
+7. Backward through adapter + LoRA, optimizer step
+
+**Reward model**: Qwen3-VL-8B-Instruct via vLLM server. Sees (input_image, text_instruction, output_image), scores 0-10 on instruction following + content preservation. Also supports perceptual reward (LPIPS + DINOv2) as a simpler alternative that doesn't require vLLM.
+
+**Memory budget (128GB unified, DGX Spark)**:
+
+| Component | Estimated |
+|-----------|-----------|
+| DiT (6.1B, bf16) | ~13GB |
+| Qwen3-VL-4B (VL splice, frozen) | ~9GB |
+| VAE (frozen) | ~1GB |
+| LoRA adapters (rank 32) | ~0.1GB |
+| ConditioningAdapter (1 layer) | ~0.3GB |
+| 8-step rollout activations | ~20-30GB |
+| Qwen3-VL-8B reward (vLLM, separate process) | ~16GB |
+| OS + buffers | ~5GB |
+| **Total** | **~65-75GB** |
+
+Fits comfortably. K=4 rollouts run sequentially (not parallel) so peak memory is 1 rollout.
+
+**VLM reward server** (run before training):
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen3-VL-8B-Instruct --max-model-len 4096 --port 8100
+```
+
+**Training data**: `composition.jsonl` — each line is a JSON array of `{"img": ...}` and `{"prompt": ...}` items. Images loaded from `images/` dir alongside the JSONL. Source: `/home/gnan/projects/data/datasets/laion__relaion-pop/composition.jsonl` (246 entries, images from relaion-pop ~114K images).
+
+Current format: `[{"img": "file1"}, {"img": "file2"}, {"prompt": "text"}]` (2 images + prompt).
+
+**TODO**: Support variable-length entries — 1 image + prompt (text-guided variation), 2 images + prompt (composition), 3+ images + prompt (multi-source composition). The `CompositionDataset` and `encode_interleaved_vl` already handle arbitrary interleaved content; the VLM reward prompt needs to adapt to variable number of references.
+
+**Turbo diversity concern**: With cfg=1.0 and 8 steps, K=4 rollouts from different seeds may produce similar outputs, making GRPO advantages noisy. Potential mitigations: increase K, use base model (50 steps, cfg=4.0) for more diversity, or add noise to conditioning.
+
+**VLM reward for composition**: VLM sees all 3 images (ref1, ref2, output) inline-labeled + the composition prompt. Scoring criteria: (1) follows composition prompt, (2) takes RIGHT elements from each reference, (3) avoids leaking UNWANTED elements, (4) coherent single image not collage, (5) visually plausible. Scores 0-10 integer with calibration guide (9-10 = accurate, 6-8 = imperfect, 3-5 = major issues, 0-2 = failure).
+
+**Wandb logging** (project: `synthos-grpo`):
+- Every step: `train/loss`, `train/kl`, `reward/mean`, `reward/std`, `reward/min`, `reward/max`, `reward/sample_0..K`, `grad/adapter_norm`, `grad/lora_norm`, `perf/step_time_s`
+- Every `eval_every` steps: rollout images (refs + K outputs with scores as captions), prompt text
+
+**Training command**:
+```bash
+python train_grpo.py \
+    --dataset /home/gnan/projects/data/datasets/laion__relaion-pop/composition.jsonl \
+    --reward vlm --reward_url http://localhost:8100 \
+    --steps 500 --group_size 4 --lr 1e-5 \
+    --lora_rank 32 --adapter_layers 1
+```
+
+### Stage 2: DiffusionNFT Training
+
+**Script**: `train_diffusionnft.py` (previously `train_grpo.py`)
+
+**Algorithm**: DiffusionNFT (arxiv.org/abs/2509.16117) — reward-weighted velocity matching on the forward diffusion process. Instead of backpropagating through the full 8-step denoising chain (OOMed on DGX Spark), DiffusionNFT needs only ONE DiT forward+backward per training sample:
+
+1. Generate K images from current model (no grad, full 8-step rollout)
+2. Score with VLM reward → normalize to [0,1]
+3. For each generated image z_0:
+   - Forward diffuse to random timestep: z_t = (1-t)*z_0 + t*ε
+   - v_θ = current model prediction (single DiT forward, WITH grad + gradient checkpointing)
+   - v_old = v_θ.detach() (EMA swap crashes on unified memory; approximation valid early in training)
+   - Loss = r·‖v_+ - v‖² + (1-r)·‖v_- - v‖² where v_± = (1∓β)·v_old ± β·v_θ
+4. Per-sample backward (frees activations between samples) → optimizer step → EMA update
+
+**Memory solution**: gradient checkpointing (native DiT support via `use_gradient_checkpointing=True`) + per-sample gradient accumulation. Without these, backward pass at 1024x1024 OOMed even for a single sample.
+
+**Test run** (5 steps, K=2): Completed successfully at ~47s/step, 53% memory (67.7GB / 130.7GB). Scores ranged 3-8, losses ~0.42-0.64. Output: `outputs/grpo_test/run_20260226_090425/`.
+
+#### What we train (two components with distinct roles)
+
+1. **CompositionModule** (previously "ConditioningAdapter") — trainable transformer block(s) sitting between `encode_interleaved_vl()` output and the DiT's frozen `cap_embedder`. The VL model encodes both input images with cross-attention in its 36 LLM layers, producing entangled visual token representations. But the VL model doesn't know what the DiT needs — it was never trained to produce "composed" conditioning. The CompositionModule learns to transform multi-image VL embeddings into a single coherent conditioning signal that the DiT can generate from. Its role is **how to mix the inputs**.
+   - Architecture: pre-norm transformer block (LayerNorm → MultiheadAttention → LayerNorm → FFN)
+   - Zero-initialized output projections → starts as identity (no disruption at init)
+   - Default: 1 layer, 16 heads, FFN mult 4.0, ~78M params
+
+2. **LoRA on DiT** — low-rank adapters on DiT Linear layers. The DiT was trained on text conditioning from a single image's caption, not on multi-image composed representations. LoRA teaches the DiT **how to generate from the composed signal** that the CompositionModule produces.
+   - Manual implementation (no HuggingFace/peft)
+   - Default: rank=32, all Linear layers with min dim ≥ 512 + adaLN_modulation, ~96M params
+
+```
+Image A ──┐
+          ├── encode_interleaved_vl() (frozen VL, cross-image attention)
+Image B ──┘          │
+                     │ (L, 2560) — visual tokens from both images
+                     ▼
+             CompositionModule (TRAINABLE) — learns to compose multi-image
+             embeddings into coherent conditioning for the DiT
+                     │ (L, 2560)
+                     ▼
+             DiT forward (LoRA TRAINABLE, base frozen) — learns to generate
+             from composed representations
+                     │
+                     ▼
+             8-step denoising → output image
+                     │
+                     ▼
+             VLM Reward (coherence scoring)
+```
+
+#### Pivot: Composition → Coherence-Based RL
+
+**Problem**: Base model can't produce decent multi-image compositions. All K rollouts score poorly (3-5 range), so there's no positive/negative contrast signal for RL. Finetuning for composition capability from scratch is too ambitious — RL refines existing capabilities, it doesn't teach new ones.
+
+**New objective**: Instead of text-guided composition ("combine elements from image A and B according to prompt"), train for coherent image blending:
+- Mix two input images → generate a "surprise" blend
+- VLM rates on coherence axes: reasonable proportions, consistent style/lighting, no artifacts, visually plausible
+- The prompt text is no longer the primary control — it's just two images being blended
+- Drop rollouts where max(scores) < threshold (no positive signal to learn from)
+
+**VLM scoring criteria** (new, coherence-focused):
+- Proportions/scale: are objects reasonably sized relative to each other?
+- Style coherence: consistent lighting, color palette, rendering style?
+- Artifacts: obvious seams, floating elements, broken anatomy?
+- Visual plausibility: does this look like a real/intentional image (not a bad collage)?
+- Score 1-10, single integer
+
+**Rollout filtering**: Skip gradient update when `max(scores) < min_reward_threshold`. Start threshold at 3 (permissive), raise as model improves. This avoids learning from all-bad groups which just add gradient noise.
+
+**Adaptive threshold idea**: Instead of fixed threshold, require at least one rollout to be >1 std above group mean. This is relative and works regardless of absolute score level.
+
+#### DiffusionNFT test runs (lyric-surf-1, wise-oath-2)
+
+**Run 1 (lyric-surf-1)**: 4 steps, K=4, eval set (50 pairs, no text). Scores 7-8, 0 skipped. VLM prompt was too lenient.
+
+**Run 2 (wise-oath-2)**: Same config, stricter VLM prompt (harsh scoring, penalizes floating objects, collage effects). Added `--cond_noise_std 0.1` for diversity. Scores dropped to ~5 — all identical per group, no contrast signal. 0 skipped.
+
+**Conclusion**: Base model's multi-image composition capability doesn't exist. All rollouts produce equally bad outputs. RL can't bridge this gap — it refines existing capabilities, doesn't teach new ones.
+
+### Conditioning Schedule Experiment
+
+**Script**: `experiment_cond_schedule.py`
+
+**Idea**: Instead of conditioning on both images from step 0, introduce the second image's conditioning partway through the 8-step denoising. Early steps establish structure from one image, late steps add influence from the other.
+
+**Three experiments per pair**:
+- **A→A+B** (`a_to_ab`): Start with image A only, introduce A+B (joint encoding) at switch point
+- **B→A+B** (`b_to_ab`): Start with image B only, introduce A+B at switch point
+- **A→B** (`a_to_b`): Start with image A only, switch to image B only at switch point (no joint encoding)
+
+**Switch points**: 0, 2, 4, 6, 8 (out of 8 total steps)
+- `s0` = use late conditioning for ALL steps
+- `s8` = use early conditioning for ALL steps (never switch)
+- `s4` = early for 4 steps, late for 4 steps
+
+**Config**: 20 pairs from `eval_unified/composition_light_notext.jsonl`, seed=42 (same noise for all gens), turbo 8 steps cfg=1.0, 1024px output.
+
+**Output**: `outputs/cond_schedule/pair_000/` through `pair_019/` — 17 files each (2 inputs + 15 generated). Total 300 generated images.
+
+**Viewer**: `viz/cond_schedule_viewer.py` (Streamlit, port 8503)
+
+**Results**: TODO — visually review outputs.
+
 ### TODOs
 - [x] **Evaluate t2i vs i2i quality** — `run_eval_40.py`, results in `outputs/eval_40_vl/`
 - [x] **Unified inference CLI** — `inference.py` (t2i + i2i, single + batch, metrics)
@@ -506,9 +702,11 @@ Script: `run_text_variations.py`
 - [x] **Composition baselines** — B3/B5/B6 with alpha sweeps, light prompts, caption-drop ablation
 - [x] **Variation strength ablation** — `run_variations.sh`, 6 max_pixels levels x 20 images
 - [x] **Text-guided variation ablation** — `run_text_variations.py`, 9 text prompts x 12 images
+- [x] **DiffusionNFT pipeline** — `train_diffusionnft.py`, ConditioningAdapter + LoRA + DiffusionNFT loss
+- [x] Set up vLLM server for Qwen3-VL-8B reward model
+- [x] Test DiffusionNFT training (5 steps, K=2, verified working)
+- [x] DiffusionNFT coherence runs — ran 2 test runs, both showed base model can't compose (no RL signal)
+- [x] Conditioning schedule experiment — 20 pairs × 3 experiments × 5 switch points = 300 images
+- [ ] Review conditioning schedule results — visually compare switch points
 - [ ] Z-Image Base model for training — may converge better with MSE loss since it's not distilled
-- [ ] Add relaion-pop dataset (`/home/gnan/projects/data/datasets/laion__relaion-pop/`) — higher resolution images
-- [ ] GRPO with LPIPS + SSIM + DINOv2 reward
-- [ ] Text-guided variation finetuning — need to amplify text token influence (5 tokens vs 153 image tokens at medium)
-- [ ] Multi-image composition as a research direction — zero-shot compositing puts elements from multiple images into one scene but doesn't truly blend styles/concepts. Training needed for real fusion.
 - [ ] Analyze baseline results — compare B3 vs B5 vs B6, effect of alpha, text vs no-text
