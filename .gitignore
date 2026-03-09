@@ -11,6 +11,9 @@ outputs/
 archive/
 eval/
 eval_unified/
+eval_obj_stitch/
+blog/
+venv/
 
 # Environment
 .env

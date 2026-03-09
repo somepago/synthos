@@ -710,3 +710,190 @@ Image B ──┘          │
 - [ ] Review conditioning schedule results — visually compare switch points
 - [ ] Z-Image Base model for training — may converge better with MSE loss since it's not distilled
 - [ ] Analyze baseline results — compare B3 vs B5 vs B6, effect of alpha, text vs no-text
+
+### Ideas to Explore
+
+1. **Cut-paste collage as input**: Take elements cut/pasted from multiple images as a single composite input image. The model might blend them into a coherent output that preserves most elements from the original while smoothing out the collage seams.
+
+2. **SigLip text embeddings for creativity**: Add SigLip text embeddings (e.g. encoding the word "creative") to the image embeddings during i2i. Could nudge the output to be more open-ended/creative while still grounded by the image tokens.
+
+3. **Intentional channel misalignment — text as SigLip embedding**: Instead of passing text through the regular text encoder channel, encode it as a SigLip text embedding (SigLip can encode text too). The DiT expects image-like features from that pathway, so text features there might produce unexpected/creative interpretations.
+
+4. **Noise on projection layer**: Add small noise to the SigLip projection weights or activations at inference time. Could introduce controlled variation/creativity in i2i outputs.
+
+5. **Noise on input image**: Add noise directly to the input image before encoding through VL. Different from denoising noise — this perturbs the visual features the model receives, potentially leading to more creative reinterpretations.
+
+## VL Splice Architecture
+
+The core discovery of this project: Z-Image-Turbo's text encoder and Qwen3-VL-4B's LLM have **identical architecture** (36 layers, 2560-dim). Splicing Z-Image's trained weights into Qwen3-VL's LLM slot gives us zero-shot i2i.
+
+```
+═══════════════════════════════════════════════════════════════════
+  Z-Image-Turbo (original t2i)
+═══════════════════════════════════════════════════════════════════
+
+  Text ──→ [ Z-Image LLM (36 layers, 2560-dim) ] ──→ (L, 2560) ──→ DiT ──→ Image
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+           This IS the text encoder. Same arch as Qwen3-VL's LLM.
+
+
+═══════════════════════════════════════════════════════════════════
+  Qwen3-VL-4B (original VLM)
+═══════════════════════════════════════════════════════════════════
+
+  Image ──→ [ ViT (24 layers, 1024-dim) ] ──→ [ PatchMerger (4096→2560) ]─┐
+                                                                           ├──→ [ Qwen LLM (36 layers, 2560-dim) ] ──→ text
+  Text  ──→ [ tokenizer + embed_tokens ]───────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════
+  VL SPLICE (what we did)
+═══════════════════════════════════════════════════════════════════
+
+  Image ──→ [ ViT (24 layers, 1024-dim) ] ──→ [ PatchMerger (4096→2560) ]─┐
+                 from Qwen3-VL                     from Qwen3-VL           │
+                                                                           ├──→ [ Z-Image LLM weights ] ──→ hidden_states[-2] ──→ (L, 2560) ──→ DiT ──→ Image
+  Text  ──→ [ tokenizer + embed_tokens ]───────────────────────────────────┘     SPLICED INTO
+                 from Qwen3-VL                                                   Qwen3-VL's LLM
+```
+
+**How it works**: `vl_model.model.language_model.load_state_dict(z_image_weights)` — literally swap the LLM weights. ViT + PatchMerger feed visual tokens (2560-dim) into the LLM, which now has Z-Image's weights that the DiT was trained to consume. Works zero-shot because the dimensions match exactly.
+
+**Code**: `src/model_utils.py:_setup_vl_splice()` loads Qwen3-VL-4B, splices Z-Image LLM weights, attaches as `pipe.vl_model`.
+
+**Encoding**: `src/diffusion.py:encode_image_vl()` — full VL forward pass with `output_hidden_states=True`, extracts `hidden_states[-2]` (penultimate LLM layer), filters by attention mask → `(L, 2560)` prompt embeddings for DiT.
+
+## Layer Tap Experiments (Mar 8, 2026)
+
+### Motivation
+
+The standard pipeline always uses `hidden_states[-2]` (LLM layer 34, penultimate) as conditioning for DiT. But there are many internal tapping points in the VL forward pass, each carrying different information:
+
+```
+Image ──→ ViT ──→ PatchMerger ──→ [LLM Layer 0] ──→ ... ──→ [LLM Layer 34] ──→ [LLM Layer 35]
+                       ↑                ↑                          ↑                  ↑
+                  post_merger      early layers              BASELINE (current)    final layer
+                  (raw visual)    (lightly processed)        hidden_states[-2]    hidden_states[-1]
+```
+
+`hidden_states` tuple has 37 entries: [embedding_output, layer_0, layer_1, ..., layer_35]. Index 0 = post-PatchMerger (before any LLM layer). All are (seq_len, 2560).
+
+### Experiment 1: Single-Image Layer Tap
+
+**Script**: `experiment_layer_tap.py`
+**Output**: `outputs/layer_tap_exp/` (200 files: 20 images × 9 layers + 20 inputs)
+
+Layers tapped: post_merger (idx 0), layer 4, 8, 12, 18, 24, 30, 34 (baseline), 35 (final).
+
+**Finding**: Layers 12 and beyond produce interesting results. Earlier layers (post-merger, layer 4, 8) produce more abstract/noisy outputs. The transition around layer 12 is where outputs start looking coherent.
+
+### Experiment 2: Multi-Image Blend + Layer Tap
+
+**Script**: `experiment_layer_tap_blend.py`
+**Output**: `outputs/layer_tap_blend/` (210 files: 15 pairs × 6 layers × 2 modes)
+
+Two blend modes at each layer:
+- **avg**: Encode each image separately, scale by alpha (0.3/0.7), concatenate. No cross-image attention.
+- **scale**: Encode both images together (cross-attention in LLM), then scale visual tokens per-image.
+
+Layers tapped: 12, 18, 24, 30, 34 (baseline), 35 (final).
+
+Used image pairs from existing multi-image experiment (`multi_avg_a0.3` entries).
+
+### Experiment 3: Multi-Image Blend + Layer Tap (Light Prompts)
+
+**Script**: `experiment_layer_tap_blend.py --entries_file eval_unified/composition_light.jsonl --output_dir outputs/layer_tap_blend_light`
+**Output**: `outputs/layer_tap_blend_light/` (210 files: 15 pairs × 6 layers × 2 modes)
+
+Same as Experiment 2 but using light text prompts alongside image pairs. The scale mode encodes images + text together (text attends to images via causal LLM attention).
+
+### Experiment 4: Text-Only Vision-Aware Conditioning
+
+**Script**: `experiment_layer_tap_textonly.py`
+**Output**: `outputs/layer_tap_textonly/` (90 files: 15 pairs × 6 layers)
+
+Images + text go through full VL forward pass, but vision tokens are **stripped** from the output. Only text tokens (which attended to image tokens via causal self-attention) are kept as DiT conditioning.
+
+**Finding**: Outputs look like regular t2i — the ~20-50 text tokens don't carry enough visual signal from attention alone. The DiT needs the actual visual tokens.
+
+### Experiment 5: Composites Layer Tap (rough composition cleanup)
+
+**Script**: `experiment_layer_tap_composites.py`
+**Output**: `outputs/layer_tap_composites/`
+
+Rough cut-paste composites from `eval_obj_stitch/composites/` fed through VL at different layers. Tests whether VL+DiT can "clean up" rough compositions zero-shot — the model sees the composite as input and generates a coherent version.
+
+5 composites × 7 layers (post_merger through layer 35).
+
+### Experiment 6: Cross-Image Attention Blocking (Isolated Blend)
+
+**Script**: `experiment_isolated_blend.py`
+**Output**: `outputs/isolated_blend/` (60 files: 15 pairs × 2 layers × 2 modes)
+
+**Problem**: In scale blend mode, both images go through the VL LLM together — Image B's tokens attend to Image A's tokens (causal self-attention). This causes unwanted object leakage: features from one image contaminate the other.
+
+**Solution**: Custom 4D attention mask that blocks cross-image attention while preserving text↔image attention:
+
+```
+Normal (scale mode):       Isolated (cross-image blocked):
+┌─────────────────────┐    ┌─────────────────────┐
+│ A attends to A  ✓   │    │ A attends to A  ✓   │
+│ B attends to A  ✓   │    │ B attends to A  ✗   │  ← BLOCKED
+│ B attends to B  ✓   │    │ B attends to B  ✓   │
+│ Text attends all ✓  │    │ Text attends all ✓  │
+└─────────────────────┘    └─────────────────────┘
+```
+
+**Implementation**: Build causal mask, then zero out cross-image regions. Convert to additive float mask (0.0=attend, -inf=block). Pre-compute position_ids with original 1D mask to avoid `get_rope_index` crash with 4D mask, then pass 4D mask + position_ids to the model.
+
+Compares scale (normal cross-attention) vs isolated (blocked) at layers 24 and 34 for 15 image pairs.
+
+### Experiment 7: SDEdit Composites (partial noise denoising)
+
+**Script**: `experiment_sdedit_composites.py`
+**Output**: `outputs/sdedit_composites/`
+
+**Problem**: Current composite i2i starts from pure noise, so the spatial layout of the composite is completely lost. The model generates a new image that captures the content/style but not the spatial arrangement.
+
+**Approach**: SDEdit-style — encode the composite through VAE to get clean latents z_0, add noise to an intermediate timestep, then denoise with VL conditioning. This preserves spatial layout while letting the model clean up seams and rough edges.
+
+```
+Composite image ──→ VAE encode ──→ z_0 (clean latents)
+                                    │
+                    noise ──→ scheduler.add_noise(z_0, noise, t_start) ──→ z_t
+                                    │
+                    VL encode ──→ prompt_embeds ──→ denoise from z_t ──→ output
+```
+
+**Denoising strength** controls how much noise:
+- 0.2: Very subtle cleanup (mostly preserves composite)
+- 0.4: Moderate cleanup
+- 0.6: Stronger reinterpretation
+- 0.8: Heavy reinterpretation (close to pure i2i)
+- 1.0: Pure noise (current i2i baseline)
+
+**Sweep**: 5 denoising strengths × 3 conditioning levels × all composites from `eval_obj_stitch/composites/`.
+
+**Conditioning levels**:
+- **No VL conditioning** (nocond): Empty text `""` through VL model — pure SDEdit spatial preservation with no semantic guidance from the composite image
+- **Medium** (384x384, ~400 tokens): Coarser VL representation + SDEdit
+- **Default** (768x768, ~1000 tokens): Fine VL representation + SDEdit
+
+The nocond row isolates the SDEdit spatial preservation effect from VL semantic guidance. Comparing nocond vs medium/default shows how much the VL conditioning contributes beyond just the noised VAE latents.
+
+### Experiment 8: Text Before vs After Image Embeddings
+
+**Script**: `experiment_text_before.py`
+**Output**: `outputs/text_before/` (30 files: 15 pairs × 2 modes)
+
+**Idea**: In causal LLM attention, token order determines what can attend to what:
+- **Text-after** (current): `[img_A] [img_B] [text]` — image tokens are processed blind to text, text attends to images but can't influence how they're encoded
+- **Text-before** (new): `[text] [img_A] [img_B]` — image tokens attend to preceding text via causal self-attention, so visual representations are "steered" by the text context
+
+If text-before produces visibly different/better results, it means the LLM is actually modulating visual feature processing based on the text context — the text "primes" the image encoding rather than being a weak afterthought (~3% of tokens).
+
+**Setup**: Scale mode, layer 34 (baseline), alpha=0.3, light prompts from `composition_light.jsonl`. Same settings as layer_tap_blend_light baseline — only variable is text position.
+
+### Viewer
+
+All experiments viewable in Streamlit: `viz/cond_schedule_viewer.py` (port 8503). Tabs: Cond Schedule, Blend Modes, Variation Strength, Text-Guided Variations, Layer Tap, Layer Tap Blend, Layer Tap Blend (Light), Text-Only (Vision-Aware), Composites, SDEdit Composites, Isolated Blend, Text Before vs After, Layer Tap Text.

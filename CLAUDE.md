@@ -18,7 +18,7 @@
 - **Frozen DiT cannot learn to attend to new SigLip tokens from random projection alone** — the attention layers were never trained with SigLip features
 - **Pure SigLip conditioning without VAE tokens is unreliable** — the omni mode noise_mask/dual-adaln path is not viable for our setup
 - **Do NOT suggest omni mode, noise_mask tricks, or dummy VAE refs** — these have been tried and failed
-- **Current approach**: Treat SigLip features as extra caption tokens through the basic (non-omni) text conditioning path. DiT LoRA comes in Stage 2.
+- **Current approach**: 
 ## Workflow Rules
 
 
